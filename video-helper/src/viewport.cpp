@@ -167,6 +167,7 @@ struct Viewport::Impl
     {
         // control-plane (mutex-guarded)
         double startSec = 0.0, durationSec = 0.0;
+        int ownerClipId = -1;                  // -1 = project-level text
         float posX = 0.0f, posY = 0.0f;       // base NDC from text_set_image
         float opacity = 1.0f;
         float translateX = 0.0f, translateY = 0.0f; // graph_set_param offsets
@@ -400,6 +401,8 @@ struct Viewport::Impl
         if (param == "opacity")    { t.opacity = (float) std::clamp (value, 0.0, 1.0); return true; }
         if (param == "translateX") { t.translateX = (float) value; return true; }
         if (param == "translateY") { t.translateY = (float) value; return true; }
+        if (param == "posX")       { t.posX = (float) value; return true; }
+        if (param == "posY")       { t.posY = (float) value; return true; }
         if (param == "visible")    { t.visible = value >= 0.5 ? 1.0f : 0.0f; return true; }
         if (param == "zOrder")     { t.zOrder = (float) value; return true; }
         return false;
@@ -764,7 +767,8 @@ std::string Viewport::setTextImage (int textId, std::vector<uint8_t> rgba,
                                     int width, int height,
                                     double startSec, double durationSec,
                                     double posX, double posY,
-                                    double opacity, double zOrder)
+                                    double opacity, double zOrder,
+                                    int ownerClipId)
 {
     if (impl_ == nullptr) return "viewport not open";
     if (width <= 0 || height <= 0 || width > 8192 || height > 8192)
@@ -781,6 +785,7 @@ std::string Viewport::setTextImage (int textId, std::vector<uint8_t> rgba,
     t.pixelsDirty = true;
     t.startSec = startSec;
     t.durationSec = durationSec;
+    t.ownerClipId = ownerClipId;
     t.posX = (float) posX;
     t.posY = (float) posY;
     t.opacity = (float) std::clamp (opacity, 0.0, 1.0);
@@ -880,6 +885,7 @@ std::string Viewport::describeGraph() const
                 { "height", t.pixelsDirty ? t.pendingH : t.texH },
                 { "startSec", t.startSec },
                 { "durationSec", t.durationSec },
+                { "ownerClipId", t.ownerClipId },
                 { "posX", t.posX },
                 { "posY", t.posY },
                 { "params", {
@@ -2435,6 +2441,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                     ov.posY = t.posY + t.translateY;
                     ov.opacity = t.opacity;
                     ov.zOrder = (int) t.zOrder;
+                    ov.ownerClipId = t.ownerClipId;
                     overlays.push_back (ov);
                 }
                 ++it;

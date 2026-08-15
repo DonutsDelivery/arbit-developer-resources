@@ -130,7 +130,8 @@ struct Score
         const Note* best = nullptr;
         for (const auto& n : notes)
             if (inTrack (n, trackId) && inRange (n, lo, hi) && n.activeAt (beat))
-                if (best == nullptr || n.startBeat > best->startBeat) best = &n;
+                if (best == nullptr || n.startBeat > best->startBeat
+                    || (n.startBeat == best->startBeat && n.id > best->id)) best = &n;
         return best;
     }
 
@@ -145,11 +146,11 @@ struct Score
         return t;
     }
 
-    int activeCount (int trackId, float beat) const
+    int activeCount (int trackId, float beat, float lo = 0.0f, float hi = 127.0f) const
     {
         int c = 0;
         for (const auto& n : notes)
-            if (inTrack (n, trackId) && n.activeAt (beat)) ++c;
+            if (inTrack (n, trackId) && inRange (n, lo, hi) && n.activeAt (beat)) ++c;
         return c;
     }
 };
@@ -196,12 +197,14 @@ inline float tenneyHeight (int num, int den, float normLog2 = 12.0f)
 
 // Sum of |prime exponent| of prime index p (0=2,1=3,2=5,3=7,4=11,5=13) over
 // notes active at `beat` — "how p-limit is this chord".
-inline float primeEnergy (const Score& score, int p, float beat)
+inline float primeEnergy (const Score& score, int p, float beat,
+                          int trackId = -1, float lo = 0.0f, float hi = 127.0f)
 {
     if (p < 0 || p > 5) return 0.0f;
     float e = 0.0f;
     for (const auto& n : score.notes)
-        if (n.activeAt (beat)) e += std::fabs (n.primes[p]);
+        if (Score::inTrack (n, trackId) && Score::inRange (n, lo, hi) && n.activeAt (beat))
+            e += std::fabs (n.primes[p]);
     return e;
 }
 
@@ -415,7 +418,7 @@ inline float evaluateSource (const ModSource& s, const Score& score,
             return clamp01 (std::exp (-age / std::max (1e-3f, s.triggerDecayBeats)));
         }
         case SourceType::NoteCount:
-            return clamp01 (static_cast<float> (score.activeCount (s.trackId, beat)) / 16.0f);
+            return clamp01 (static_cast<float> (score.activeCount (s.trackId, beat, s.pitchLo, s.pitchHi)) / 16.0f);
         case SourceType::NoteAge:
         {
             const float onset = score.latestOnsetBeat (s.trackId, beat, s.pitchLo, s.pitchHi);
@@ -427,13 +430,15 @@ inline float evaluateSource (const ModSource& s, const Score& score,
             return n ? centsFromRoot (n->freqHz, score.rootFreq) : 0.0f;   // cents
         }
         case SourceType::PrimeEnergy:
-            return primeEnergy (score, s.primeIndex, beat);
+            return primeEnergy (score, s.primeIndex, beat, s.trackId, s.pitchLo, s.pitchHi);
         case SourceType::RootTrigger:
         {
             // Impulse (exp decay) on the most recent root-note onset.
             float onset = -1e30f;
             for (const auto& n : score.notes)
-                if (n.isRoot && n.startedBy (beat)) onset = std::max (onset, n.startBeat);
+                if (n.isRoot && Score::inTrack (n, s.trackId)
+                    && Score::inRange (n, s.pitchLo, s.pitchHi) && n.startedBy (beat))
+                    onset = std::max (onset, n.startBeat);
             if (onset < -1e29f) return 0.0f;
             return clamp01 (std::exp (-(beat - onset) / std::max (1e-3f, s.triggerDecayBeats)));
         }

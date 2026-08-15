@@ -1020,6 +1020,7 @@ std::map<int, std::vector<BakedTrack>> parseBakedTimeline (const ExportJob& job)
 struct TextRenderState
 {
     float opacity = 1.0f;
+    float posX = 0.0f, posY = 0.0f;
     float translateX = 0.0f, translateY = 0.0f;
     float visible = 1.0f;
     float zOrder = 0.0f;
@@ -1028,6 +1029,8 @@ struct TextRenderState
 bool applyTextParam (TextRenderState& t, const std::string& param, double value)
 {
     if (param == "opacity")    { t.opacity = (float) std::clamp (value, 0.0, 1.0); return true; }
+    if (param == "posX")       { t.posX = (float) value; return true; }
+    if (param == "posY")       { t.posY = (float) value; return true; }
     if (param == "translateX") { t.translateX = (float) value; return true; }
     if (param == "translateY") { t.translateY = (float) value; return true; }
     if (param == "visible")    { t.visible = value >= 0.5 ? 1.0f : 0.0f; return true; }
@@ -2154,6 +2157,8 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
             const auto& tx = *tl.tx;
             TextRenderState ts;
             ts.opacity = (float) std::clamp (tx.opacity, 0.0, 1.0);
+            ts.posX = (float) tx.posX;
+            ts.posY = (float) tx.posY;
             ts.zOrder = (float) tx.zOrder;
             if (const auto it = bakedByText.find (tx.textId); it != bakedByText.end())
                 for (const auto& tr : it->second)
@@ -2165,10 +2170,11 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
             ov.texture = tl.tex;
             ov.width = tx.width;
             ov.height = tx.height;
-            ov.posX = (float) tx.posX + ts.translateX;
-            ov.posY = (float) tx.posY + ts.translateY;
+            ov.posX = ts.posX + ts.translateX;
+            ov.posY = ts.posY + ts.translateY;
             ov.opacity = ts.opacity;
             ov.zOrder = (int) ts.zOrder;
+            ov.ownerClipId = tx.ownerClipId;
             overlays.push_back (ov);
         }
         std::stable_sort (overlays.begin(), overlays.end(),
@@ -2867,5 +2873,197 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
     // A cancelled export must not leave a truncated file behind.
     if (error == "cancelled")
         std::remove (job.outPath.c_str());
+    return error;
+}
+
+//======================================================================
+// RecorderSession — push-frame encode for the live piano-roll recorder
+// (record_open / record_push_frame / record_close RPCs). See exporter.h for
+// the "why": reuses pickVideoEncoder/tagColorBt709/encodeAndWrite verbatim so
+// a recording gets the same hardware-encoder choice and colour tagging as a
+// normal export, with none of runExport's timeline-compositing machinery.
+
+struct RecorderSession::Impl
+{
+    AVFormatContext* fmt = nullptr;
+    AVCodecContext* enc = nullptr;
+    AVStream* stream = nullptr;
+    AVFrame* yuvFrame = nullptr;   // encoder-ready, yuv420p
+    SwsContext* sws = nullptr;     // bgra/rgba -> yuv420p
+    int srcPixFmt = -1;            // AV_PIX_FMT of the sws source (rebuild if it changes)
+    int width = 0, height = 0;
+    int64_t frameCount = 0;
+    bool headerWritten = false;
+    std::string outPath;
+
+    ~Impl() { teardown(); }
+
+    void teardown()
+    {
+        if (sws != nullptr) { sws_freeContext (sws); sws = nullptr; }
+        if (yuvFrame != nullptr) av_frame_free (&yuvFrame);
+        if (enc != nullptr) avcodec_free_context (&enc);
+        if (fmt != nullptr)
+        {
+            if (! (fmt->oformat->flags & AVFMT_NOFILE) && fmt->pb != nullptr)
+                avio_closep (&fmt->pb);
+            avformat_free_context (fmt);
+            fmt = nullptr;
+        }
+        headerWritten = false;
+        stream = nullptr;
+    }
+};
+
+RecorderSession::RecorderSession() : impl_ (std::make_unique<Impl>()) {}
+RecorderSession::~RecorderSession() = default;
+
+bool RecorderSession::isOpen() const { return impl_->fmt != nullptr; }
+int64_t RecorderSession::framesEncoded() const { return impl_->frameCount; }
+
+std::string RecorderSession::open (const std::string& outPath, int width, int height,
+                                   double fps, const std::string& codec,
+                                   const std::string& encoder)
+{
+    if (impl_->fmt != nullptr)
+        return "recorder session already open";
+    if (width <= 0 || height <= 0 || fps <= 0.0)
+        return "invalid recorder dimensions/fps";
+
+    // pickVideoEncoder/softwareEncoderName only read job.codec/job.encoder —
+    // a stub ExportJob with just those two set is a safe, honest reuse.
+    ExportJob stub;
+    stub.codec = codec;
+    stub.encoder = encoder;
+
+    std::string encName;
+    const AVCodec* vCodec = pickVideoEncoder (stub, encName);
+    if (vCodec == nullptr)
+        return "video encoder unavailable: " + encName;
+
+    AVFormatContext* fmt = nullptr;
+    if (avformat_alloc_output_context2 (&fmt, nullptr, nullptr, outPath.c_str()) < 0
+        || fmt == nullptr)
+        return "cannot create output context for " + outPath;
+
+    const AVRational fpsQ = av_d2q (fps, 100000);
+    AVCodecContext* enc = avcodec_alloc_context3 (vCodec);
+    enc->width = width & ~1;
+    enc->height = height & ~1;
+    enc->pix_fmt = AV_PIX_FMT_YUV420P; // recordings are always SDR h264/h265 — no
+                                        // ProRes/DPX pixel formats to branch on
+    enc->time_base = av_inv_q (fpsQ);
+    enc->framerate = fpsQ;
+    enc->gop_size = (int) std::lround (fps * 2.0);
+    if (fmt->oformat->flags & AVFMT_GLOBALHEADER)
+        enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    if (encName == "libx264" || encName == "libx265")
+    {
+        av_opt_set (enc->priv_data, "preset", "veryfast", 0);
+        av_opt_set (enc->priv_data, "crf", "20", 0);
+    }
+    else
+        enc->bit_rate = (int64_t) width * height * 8; // ~16 Mbps at 1080p, same as export
+
+    tagColorBt709 (enc);
+
+    if (avcodec_open2 (enc, vCodec, nullptr) < 0)
+    {
+        avcodec_free_context (&enc);
+        avformat_free_context (fmt);
+        // "auto" falls back to software when the hardware encoder won't open —
+        // same fallback runExport does.
+        if (encoder == "auto" && encName != softwareEncoderName (codec))
+            return open (outPath, width, height, fps, codec, "software");
+        return "cannot open video encoder " + encName;
+    }
+
+    AVStream* stream = avformat_new_stream (fmt, nullptr);
+    avcodec_parameters_from_context (stream->codecpar, enc);
+    stream->time_base = enc->time_base;
+
+    if (! (fmt->oformat->flags & AVFMT_NOFILE)
+        && avio_open (&fmt->pb, outPath.c_str(), AVIO_FLAG_WRITE) < 0)
+    {
+        avcodec_free_context (&enc);
+        avformat_free_context (fmt);
+        return "cannot open output file " + outPath;
+    }
+
+    if (avformat_write_header (fmt, nullptr) < 0)
+    {
+        avcodec_free_context (&enc);
+        if (! (fmt->oformat->flags & AVFMT_NOFILE) && fmt->pb != nullptr)
+            avio_closep (&fmt->pb);
+        avformat_free_context (fmt);
+        return "write_header failed";
+    }
+
+    AVFrame* yuvFrame = av_frame_alloc();
+    yuvFrame->format = enc->pix_fmt;
+    yuvFrame->width = enc->width;
+    yuvFrame->height = enc->height;
+    av_frame_get_buffer (yuvFrame, 0);
+
+    impl_->fmt = fmt;
+    impl_->enc = enc;
+    impl_->stream = stream;
+    impl_->yuvFrame = yuvFrame;
+    impl_->width = enc->width;
+    impl_->height = enc->height;
+    impl_->headerWritten = true;
+    impl_->frameCount = 0;
+    impl_->outPath = outPath;
+    return {};
+}
+
+std::string RecorderSession::pushFrame (const uint8_t* pixels, int strideBytes, bool bgra)
+{
+    if (impl_->fmt == nullptr)
+        return "recorder session not open";
+    if (pixels == nullptr || strideBytes <= 0)
+        return "invalid frame buffer";
+
+    const AVPixelFormat srcFmt = bgra ? AV_PIX_FMT_BGRA : AV_PIX_FMT_RGBA;
+    if (impl_->sws == nullptr || impl_->srcPixFmt != (int) srcFmt)
+    {
+        if (impl_->sws != nullptr) sws_freeContext (impl_->sws);
+        impl_->sws = sws_getContext (impl_->width, impl_->height, srcFmt,
+                                     impl_->width, impl_->height, AV_PIX_FMT_YUV420P,
+                                     SWS_BILINEAR, nullptr, nullptr, nullptr);
+        impl_->srcPixFmt = (int) srcFmt;
+        if (impl_->sws == nullptr)
+            return "sws_getContext (capture->encoder) failed";
+    }
+
+    if (av_frame_make_writable (impl_->yuvFrame) < 0)
+        return "frame not writable";
+
+    const uint8_t* srcSlices[1] = { pixels };
+    const int srcStrides[1] = { strideBytes };
+    sws_scale (impl_->sws, srcSlices, srcStrides, 0, impl_->height,
+              impl_->yuvFrame->data, impl_->yuvFrame->linesize);
+
+    impl_->yuvFrame->pts = impl_->frameCount;
+    auto err = encodeAndWrite (impl_->fmt, impl_->stream, impl_->enc, impl_->yuvFrame);
+    if (! err.empty())
+        return err;
+    ++impl_->frameCount;
+    return {};
+}
+
+std::string RecorderSession::close()
+{
+    if (impl_->fmt == nullptr)
+        return {}; // never opened / already closed — not an error, matches Region::close()
+
+    std::string error = encodeAndWrite (impl_->fmt, impl_->stream, impl_->enc, nullptr); // flush
+    if (error.empty() && impl_->headerWritten && av_write_trailer (impl_->fmt) < 0)
+        error = "write_trailer failed";
+
+    if (! error.empty())
+        std::remove (impl_->outPath.c_str()); // no truncated file left behind, same as runExport
+
+    impl_->teardown();
     return error;
 }

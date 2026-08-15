@@ -57,6 +57,21 @@ struct ProxyProgress
     std::atomic<bool> abort { false };
 };
 
+// One process-wide CUDA hardware-decode device context, shared by every
+// MediaContext decode session (NVIDIA's guidance: allocate the minimum number
+// of CUDA contexts and share them across sessions). Lazily created under
+// std::call_once and returned as a borrowed pointer (callers av_buffer_ref it);
+// nullptr when CUDA is unavailable or ARBIT_DISABLE_HWDEC is set, in which case
+// callers fall back to software decode.
+//
+// IMPORTANT: main() calls this ONCE at startup, before any worker/render thread
+// spawns, so the CUDA init runs single-threaded. Initializing CUDA concurrently
+// from two threads (the viewport render-thread decoder + the InterpEngine
+// worker) is what previously deadlocked the NVIDIA driver and motivated the
+// software-only fallback — that was an app-side concurrent-init bug, not a
+// hardware decode-session limit (GeForce NVDEC has none).
+AVBufferRef* sharedCudaDeviceCtx();
+
 class MediaContext
 {
 public:

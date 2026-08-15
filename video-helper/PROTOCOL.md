@@ -141,8 +141,8 @@ then the wheels, then the grading looks/stylize/vignette. `kMaxEffectParams`
 was bumped 4 → 9 for the wheels; both serializers, the jobSpec and the
 automation subParam packing are count-driven and unaffected by the bump.
 
-Text overlays are addressable as `text<id>/{opacity, translateX, translateY,
-visible, zOrder}` once registered via `text_set_image`.
+Text overlays are addressable as `text<id>/{opacity, posX, posY, translateX,
+translateY, visible, zOrder}` once registered via `text_set_image`.
 
 - `graph_set_param {paramId, value, atBeat?, interpolation?}` — immediate
   when `atBeat` is omitted/negative; otherwise queued and applied when the
@@ -178,8 +178,9 @@ RGBA (top row first, stride width×4 — the compositor's blend pass computes
 `mix(back, front, front.a × opacity)`, i.e. straight-alpha) and ships the
 pixels; preview and export therefore match exactly.
 
-- `text_set_image {textId, shmName, width, height, startSec, durationSec,
-  posX, posY (NDC −1..1, +posY = down like translateY), opacity, zOrder}` —
+- `text_set_image {textId, ownerClipId?, shmName, width, height, startSec,
+  durationSec, posX, posY (NDC −1..1, +posY = down like translateY), opacity,
+  zOrder}` —
   register/update an overlay. Pixels are read once (while handling the RPC)
   from slot 0 of the named shm region (same mechanism as the frame ring) and
   uploaded to a texture by the render thread; the region can be reused or
@@ -299,6 +300,75 @@ Zero-copy is implemented on all three platforms (see §Zero-copy docked
 viewport above); shm-docked remains the rung beneath it for GLX/X11
 sessions, DAW-hosted plugins, drivers without export/interop support, and
 helper builds without a shared-GPU backend.
+
+## Recorder (piano-roll live capture → encode)
+
+The exact reverse of the decode ring (`attach_shm`/`request_frame` above):
+there, Arbit creates the shm region and the HELPER writes decoded frames for
+Arbit to read. Here, Arbit creates the shm region and Arbit ITSELF writes
+already-rendered piano-roll frames (its own `Component::createComponentSnapshot`
+capture, not anything decoded or GL-composited by the helper) for the helper
+to read and encode. Same `videoshm::Region` class, same seqlock ring, opposite
+producer/consumer roles — no new shared-memory mechanism, just the existing
+one used the other way.
+
+This is a separate, much smaller code path than `export` (§Export below): no
+GL compositing, no render graph, no audio, no ProRes/DPX — just raw BGRA
+frames pushed in one at a time and muxed straight to a file. The encoder
+selection (hardware nvenc/videotoolbox preference, falling back to software)
+and BT.709 colour tagging are shared with `export` via the same
+`pickVideoEncoder`/`tagColorBt709`/`encodeAndWrite` functions (`exporter.cpp`),
+so a recording gets the same encoder choice an export would — the only new
+code is the class that opens/feeds/closes them per-frame instead of from a
+composited timeline (`RecorderSession`, `exporter.h`/`exporter.cpp`).
+
+`record_open {width, height, fps, shmName, outPath, codec, encoder}` — Arbit
+creates and names the shm region (sized for `width`×`height` BGRA8 frames)
+and calls this with its name; the helper opens the region AND opens the
+output file's encoder (`codec`: `"h264"` default | `"h265"`; `encoder`:
+`"auto"` default (prefer hw) | `"software"`). Returns
+`{ok: true, recordingId: N}`. `recordingId` uniquely owns this encoder and
+shared-memory ring until it is closed or cancelled; multiple recording IDs
+may be active concurrently.
+
+`record_push_frame {recordingId, slot}` — Arbit has already written one BGRA8
+frame into `slot` of that recording's shm ring (same seqlock write protocol
+viewport-shm's helper→Arbit direction uses, just performed by Arbit here) and
+calls this to have the helper read, scale (bilinear BGRA→YUV420P, matching
+`export`'s sws pipeline), and encode that slot. Returns `{ok: true,
+framesEncoded: N}`, or an error if the ID is unknown or the slot is torn.
+
+`record_close {recordingId}` — removes only that recording from the helper's
+session map, flushes its encoder, writes its trailer, and releases its shm
+ring. Other recording IDs remain active.
+
+`record_cancel {recordingId}` — performs the same isolated teardown, then
+removes the partial output file.
+
+## Live capture sources
+
+`capture_list_sources {kind?}` enumerates devices without opening them. It
+returns `{sources:[{id,name,kind,backend,availableFormats}], enumerationError}`.
+Persist `id` verbatim: an unplugged device may later return with the same ID.
+Passing `kind:"test"` exposes the deterministic FFmpeg `lavfi` test pattern
+used by smoke tests when no physical camera is available.
+
+`capture_preview_open {sourceId,backend,width,height,fps,shmName}` opens the
+source on a helper worker thread and returns `{captureId}`. Arbit creates the
+BGRA8 shared-memory ring named by `shmName`; the helper continuously publishes
+the newest decoded frame there using the standard seqlock protocol.
+
+`capture_preview_latest {captureId}` returns `{pending:true}` until the first
+frame, then `{slot,sequence,timestampSec,width,height,strideBytes}`. Pixel data
+never travels over JSON. Device-open, permission, unplug, decode, and timeout
+errors are returned as structured RPC errors.
+
+`capture_record_start {captureId,recordingId,outPath,codec}` attaches an
+independent `RecorderSession` to that decoded source. Any number of recording
+IDs may consume one capture source. `capture_record_stop
+{captureId,recordingId,cancel?}` finalizes only that recording; `cancel:true`
+also removes its partial output. `capture_close {captureId}` stops the worker,
+finalizes attached recorders, and releases the preview ring.
 
 ## Introspection
 
@@ -448,15 +518,18 @@ encoder/interpolation/audioPath/durationSec/startSec/endSec):
   (native range). The helper interpolates **linearly** between samples of
   the same paramId and holds the first/last value outside them, overlaying
   the static clip/text state per output frame.
-- `texts: [{textId, startSec, durationSec, posX, posY, opacity, zOrder,
+- `texts: [{textId, ownerClipId?, startSec, durationSec, posX, posY, opacity, zOrder,
   width, height, rgbaBase64}]` — text overlays. `rgbaBase64` is the SAME
   straight (non-premultiplied) RGBA block `text_set_image` ships for the
   live viewport (top row first, stride width×4, rasterized by Arbit),
   base64-encoded **inline in the jobSpec** instead of via shm: exports must
   work headless with no viewport open, and the text shm transport is
-  serviced by the viewport's render thread. Overlays composite above all
-  video layers in zOrder (ties broken by textId, matching the viewport),
-  each at its natural pixel size centred at `(posX + translateX,
+  serviced by the viewport's render thread. Project overlays and text owned by
+  ordinary clips composite above all video layers in zOrder. Text owned by an
+  adjustment clip is inserted immediately before that adjustment, so its
+  transform/crop/mask/effects process the text and accumulated video together.
+  Ties are broken by textId, matching the viewport. Each renders at its natural
+  pixel size centred at `(posX + translateX,
   posY + translateY)` NDC, for `startSec ≤ t < startSec + durationSec`.
   Entries with missing/undecodable pixels keep their timing but draw
   nothing. Text overlays render on the GL path only — the CPU fallback

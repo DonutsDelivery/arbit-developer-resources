@@ -11,6 +11,7 @@ extern "C"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 
@@ -49,6 +50,30 @@ AVPixelFormat getHwFormat (AVCodecContext* ctx, const AVPixelFormat* fmts)
 }
 } // namespace
 
+AVBufferRef* sharedCudaDeviceCtx()
+{
+    // Create exactly ONE CUDA device context for the whole process, lazily and
+    // single-threaded (call_once). Sharing one hw_device_ctx across all decode
+    // sessions — instead of av_hwdevice_ctx_create per MediaContext — avoids the
+    // concurrent cuInit()/CUDA-context creation that deadlocked the driver when
+    // two threads opened hw decoders at once. main() pokes this at startup so the
+    // one-time init happens before any worker/render thread exists.
+    static std::once_flag onceFlag;
+    static AVBufferRef* ctx = nullptr;
+    std::call_once (onceFlag, []
+    {
+        if (std::getenv ("ARBIT_DISABLE_HWDEC") != nullptr)
+            return; // escape hatch: ctx stays nullptr -> software everywhere
+        AVBufferRef* created = nullptr;
+        if (av_hwdevice_ctx_create (&created, AV_HWDEVICE_TYPE_CUDA,
+                                    nullptr, nullptr, 0) == 0)
+            ctx = created; // permanent process-lifetime ref (never unref'd)
+        // On failure (no NVIDIA / no CUDA in this FFmpeg build) ctx stays
+        // nullptr and callers silently fall back to software decode.
+    });
+    return ctx;
+}
+
 bool MediaContext::tryOpenHwDecoder (const AVCodec* codec)
 {
     // Platform preference order; each is tried only if this FFmpeg build and
@@ -84,7 +109,27 @@ bool MediaContext::tryOpenHwDecoder (const AVCodec* codec)
         if (hwFmt == AV_PIX_FMT_NONE) continue;
 
         AVBufferRef* deviceCtx = nullptr;
-        if (av_hwdevice_ctx_create (&deviceCtx, preferred[t], nullptr, nullptr, 0) < 0)
+        if (preferred[t] == AV_HWDEVICE_TYPE_CUDA)
+        {
+            // Reference the ONE shared CUDA device context instead of creating a
+            // new one here — av_buffer_ref only bumps a refcount, so no second
+            // cuInit/CUDA-context creation runs on this thread (that concurrent
+            // init is what deadlocked the driver). nullptr = unavailable or
+            // ARBIT_DISABLE_HWDEC set -> fall through to the next device type
+            // (then software).
+            //
+            // Thread-safety: FFmpeg's CUDA hwcontext makes the shared CUDA
+            // context current per operation (cuCtxPushCurrent/PopCurrent) and
+            // serializes access via the AVHWDeviceContext lock callbacks, so
+            // multiple decode threads referencing the same hw_device_ctx is the
+            // supported, recommended pattern — each MediaContext still has its
+            // own AVCodecContext.
+            AVBufferRef* shared = sharedCudaDeviceCtx();
+            if (shared == nullptr) continue;
+            deviceCtx = av_buffer_ref (shared);
+            if (deviceCtx == nullptr) continue;
+        }
+        else if (av_hwdevice_ctx_create (&deviceCtx, preferred[t], nullptr, nullptr, 0) < 0)
             continue;
 
         hwDeviceCtx_ = deviceCtx;

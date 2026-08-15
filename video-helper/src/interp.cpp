@@ -261,10 +261,16 @@ void InterpEngine::Impl::processRequest (const Request& r)
     if (d.media == nullptr && ! d.openFailed)
     {
         d.media = std::make_unique<MediaContext>();
-        // Software decode: a second hw session next to the render thread's
-        // intermittently deadlocks the NVIDIA driver (same reason exporter.cpp
-        // decodes in software).
-        if (! d.media->open (r.sourcePath, false, r.sourceFps, r.seqStart).empty())
+        // Hardware decode (NVDEC on NVIDIA). This worker and the viewport render
+        // thread now share the ONE process-wide CUDA device context created
+        // single-threaded at startup (sharedCudaDeviceCtx), so opening a hw
+        // decoder here no longer triggers a concurrent CUDA init next to the
+        // render thread's — the race that previously deadlocked the driver and
+        // forced software decode. RIFE still needs CPU pixels; getFrame() ->
+        // downloadIfHw() transfers hw frames back via av_hwframe_transfer_data.
+        // Falls back to software automatically if hw decode is unavailable or
+        // ARBIT_DISABLE_HWDEC is set.
+        if (! d.media->open (r.sourcePath, true, r.sourceFps, r.seqStart).empty())
         {
             d.media.reset();
             d.openFailed = true;

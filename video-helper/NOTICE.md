@@ -66,7 +66,4 @@ next to `arbit-video-helper`. None of them are modified by us. Sources:
   upstream source URLs and patches) are at
   <https://github.com/Homebrew/homebrew-core>.
 
-If you would like the exact corresponding source archive for any binary
-we distribute (the helper itself or any bundled library, for any
-specific DonutStudio release), open an issue on this repository and we
-will provide it.
+The complete corresponding source for the helper shipped with DonutStudio v0.6.0 is this repository tree. The exact app release, private source commit, and helper-tree digest are recorded in `SOURCE-CORRESPONDENCE.json`. Source locations for bundled third-party libraries are listed above.

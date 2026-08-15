@@ -129,13 +129,6 @@ directory remains available under GPL-2.0-or-later as declared in
 
 ## Release correspondence
 
-This source corresponds to the `arbit-video-helper` binaries shipped
-with **DonutStudio v0.5.1**. (The helper's internal `project()` version
-is a static `0.1.0` and does not track app releases; correlate by app
-version.) Future DonutStudio releases that change the helper will update
-this directory in lockstep.
+This source corresponds exactly to the `arbit-video-helper` binaries shipped with **DonutStudio v0.6.0**. It was exported from private source commit `69911339c41a284dd87d5290b81dd61579133483`; the implementation tree identified by path and Git blob has SHA-256 `0e553bd0a30578beeac8357084b1abf96ab9006d6ee525a9099472b54605fabb`.
 
-If you want the exact corresponding source archive for the helper binary
-in any specific DonutStudio release, or for any of the third-party
-libraries bundled alongside it, open an issue on this repository and we
-will provide it.
+The helper's internal `project()` version remains `0.1.0` and does not track the app version. See [`SOURCE-CORRESPONDENCE.json`](SOURCE-CORRESPONDENCE.json) for the machine-readable mapping. A later DonutStudio release may reference this same source commit only when its distributed helper is unchanged.

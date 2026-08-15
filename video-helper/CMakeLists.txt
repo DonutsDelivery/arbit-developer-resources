@@ -23,7 +23,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(AV REQUIRED IMPORTED_TARGET
-    libavformat libavcodec libavutil libswscale libswresample libavfilter)
+    libavformat libavcodec libavutil libavdevice libswscale libswresample libavfilter)
 pkg_check_modules(AUBIO IMPORTED_TARGET aubio)
 
 # Per-frame Lua hook (M8 "agent-programmable media machine"). Optional — without
@@ -58,6 +58,7 @@ find_package(OpenGL QUIET)
 
 add_executable(arbit-video-helper
     src/main.cpp
+    src/capture_device.cpp
     src/media.cpp
     src/exporter.cpp
 )
@@ -219,7 +220,12 @@ endif()
 # newest release that still defines the afpvec8 packed-fp16 shader type +
 # Option::use_shader_pack8 that the 2022-era net source uses (both removed by
 # ncnn 20251225). See artifacts/media-machine/rife-ncnn-vulkan-plan.md.
-option(ARBIT_WITH_NCNN "Enable portable RIFE frame interpolation via ncnn + Vulkan" ON)
+# ncnn's SIMPLEVK path expects a Vulkan loader symbol at link time on macOS.
+# MoltenVK satisfies that (see Apple branch below). Default ON everywhere so
+# the shipped helper includes Speed Warp; configure -DARBIT_WITH_NCNN=OFF to
+# strip RIFE. macOS CI installs molten-vk via Homebrew and asserts rife-vulkan.
+set(_arbit_ncnn_default ON)
+option(ARBIT_WITH_NCNN "Enable portable RIFE frame interpolation via ncnn + Vulkan" ${_arbit_ncnn_default})
 # Zero-copy GPU RIFE output (Phase 1b): keep the RIFE result on the GPU and export
 # it to OpenGL via OPAQUE_FD instead of bouncing it through CPU. Needs the REAL
 # Vulkan headers (ncnn's in-house simplevk.h lacks the external-memory structs) and
@@ -263,6 +269,22 @@ if(ARBIT_WITH_NCNN)
         endif()
         set(Vulkan_INCLUDE_DIR ${vulkanheaders_SOURCE_DIR}/include CACHE PATH "" FORCE)
         set(Vulkan_LIBRARY ${ARBIT_VULKAN_LOADER} CACHE FILEPATH "" FORCE)
+    elseif(APPLE)
+        # ncnn's SimpleVK uses STATIC link-time Vulkan linkage on Apple platforms
+        # (unlike the dlopen path used on Linux/Windows/Android) — see ncnn's
+        # src/CMakeLists.txt "simplevk always use static vulkan linkage on apple
+        # platform". If Vulkan_LIBRARY isn't defined there, ncnn's own CMake only
+        # WARNS and links nothing, so the helper would build fine but never find a
+        # GPU. MoltenVK is itself a complete Vulkan-API implementation (not just a
+        # loader), so linking it directly satisfies vkGetInstanceProcAddr et al.
+        # with no separate loader / ICD-JSON discovery step needed.
+        find_library(ARBIT_MOLTENVK_LIBRARY NAMES MoltenVK)
+        if(NOT ARBIT_MOLTENVK_LIBRARY)
+            message(FATAL_ERROR
+                "ARBIT_WITH_NCNN=ON needs MoltenVK on macOS (brew install molten-vk), "
+                "or configure -DARBIT_WITH_NCNN=OFF to build without RIFE support.")
+        endif()
+        set(Vulkan_LIBRARY ${ARBIT_MOLTENVK_LIBRARY} CACHE FILEPATH "" FORCE)
     endif()
 
     # ncnn 20250503 only enables base VK_KHR_external_memory; the PATCH_COMMAND adds
@@ -278,6 +300,18 @@ if(ARBIT_WITH_NCNN)
     # under CMake 4.x (harmless on older CMake).
     set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
     FetchContent_MakeAvailable(ncnn)
+
+    # GCC 13 can ICE in cfgcleanup while compiling ncnn's generated AVX packing
+    # unit with ncnn's own -Ofast flags (GCC PR-style internal failure, not a
+    # source diagnostic). Override that dependency target to -O2 only on the
+    # affected compiler generation. GNU 12/14+, Clang, and DonutStudio's own
+    # targets retain their existing release optimization settings.
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
+       AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 13
+       AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 14)
+        target_compile_options(ncnn PRIVATE -O2)
+    endif()
+
     if(ARBIT_NCNN_ZEROCOPY)
         # activates the gpu.cpp patch block
         target_compile_definitions(ncnn PRIVATE ARBIT_RIFE_ZEROCOPY)
@@ -336,9 +370,8 @@ if(ARBIT_WITH_NCNN OR ARBIT_WITH_ONNX)
 endif()
 
 target_include_directories(arbit-video-helper PRIVATE
-    # VideoFrameSharedMemory.h / SharedGpuSurfaceProtocol.h are shared with the
-    # DonutStudio plugin (dependency-free IPC headers, vendored in shared/)
-    ${CMAKE_CURRENT_SOURCE_DIR}/shared
+    # VideoFrameSharedMemory.h is shared with the plugin (dependency-free header)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../plugin/Source
 )
 
 target_link_libraries(arbit-video-helper PRIVATE
@@ -420,6 +453,12 @@ if(WIN32)
     # windows.h (pulled in by VideoFrameSharedMemory.h / gl_loader.h) defines
     # min/max macros that break std::min/std::max.
     target_compile_definitions(arbit-video-helper PRIVATE NOMINMAX)
+
+    # FFmpeg, zimg, and the rest of the DLL closure come from MSYS2. Keep the
+    # helper's own GCC C++ and GCC support runtimes inside the executable so a
+    # different libstdc++ ABI cannot be selected to satisfy both the Ubuntu
+    # cross-compiler and the MSYS2 dependency graph at process startup.
+    target_link_options(arbit-video-helper PRIVATE -static-libstdc++ -static-libgcc)
 endif()
 
 if(UNIX AND NOT APPLE)
@@ -440,3 +479,14 @@ if(NOT MSVC)
     target_compile_options(arbit-video-param-tests PRIVATE -Wall -Wextra)
 endif()
 add_test(NAME video_param_grammar COMMAND arbit-video-param-tests)
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND AND UNIX)
+    add_test(NAME concurrent_recorder_smoke
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrent_recorder_smoke.py
+                $<TARGET_FILE:arbit-video-helper>)
+    add_test(NAME capture_source_smoke
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/capture_source_smoke.py
+                $<TARGET_FILE:arbit-video-helper>)
+    set_tests_properties(concurrent_recorder_smoke capture_source_smoke PROPERTIES TIMEOUT 30)
+endif()

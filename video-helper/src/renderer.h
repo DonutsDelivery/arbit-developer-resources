@@ -157,8 +157,9 @@ struct LayerDesc
     // source of its own (texture == 0, no shaderSource). Instead its effects
     // rack runs over the composite of every layer beneath it, and the result is
     // mixed back over that composite at `opacity` (1 = full adjustment, <1 =
-    // partial). transform/crop/mask are ignored in v1 (full-frame); only the
-    // rack + opacity apply. Handled by a dedicated branch in renderComposite.
+    // partial). Transform/crop/mask apply to the accumulated composite, so an
+    // adjustment can also be used as an animated group transform. Handled by
+    // a dedicated branch in renderComposite.
     bool isAdjustment = false;
 
     // Leading-edge transition: when transitionType != 0 this layer's content
@@ -181,6 +182,10 @@ struct ImageLayerDesc
                                     // as LayerDesc::translateX/translateY
     float opacity = 1.0f;
     int zOrder = 0;                // caller sorts; renderer draws in order given
+    // Clip-owned text attached to an adjustment clip is inserted immediately
+    // before that adjustment, so its accumulated-composite transform/effects
+    // include the text. -1 keeps the overlay at project/top level.
+    int ownerClipId = -1;
 };
 
 class FrameRenderer

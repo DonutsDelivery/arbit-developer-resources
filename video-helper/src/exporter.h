@@ -20,6 +20,7 @@
 #include <atomic>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -142,6 +143,7 @@ struct ExportParamSample
 struct ExportTextOverlay
 {
     int textId = 0;
+    int ownerClipId = -1;
     double startSec = 0.0, durationSec = 0.0;
     double posX = 0.0, posY = 0.0; // NDC, same convention as ImageLayerDesc
     double opacity = 1.0;
@@ -309,3 +311,49 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
                        bool& glCompositingOut,
                        std::string& interpolationBackendOut,
                        ExportProgress* progress = nullptr);
+
+// RecorderSession — push-frame video-only encode session, for the live
+// piano-roll recorder (record_open / record_push_frame / record_close RPCs).
+// Unlike runExport (which composites a whole timeline from an ExportJob),
+// this takes ALREADY-RENDERED frames one at a time from the caller (Arbit's
+// own capture loop) and muxes them straight to a file — no audio, no DPX/
+// ProRes, no GL compositing. It shares the exact same encoder-selection
+// (pickVideoEncoder), colour tagging (tagColorBt709), and packet-writing
+// (encodeAndWrite) codepaths runExport uses, so a recording gets the same
+// hardware-encoder preference and BT.709 tagging as a normal export — no
+// separate/duplicated muxer logic to maintain. Implementation detail (AVFormat/
+// AVCodec/SwsContext) stays behind a pimpl so this header stays FFmpeg-free,
+// matching the rest of exporter.h.
+class RecorderSession
+{
+public:
+    RecorderSession();
+    ~RecorderSession();
+    RecorderSession (const RecorderSession&) = delete;
+    RecorderSession& operator= (const RecorderSession&) = delete;
+
+    // codec: "h264" (default) or "h265" — the only codecs a live recording
+    // needs; ProRes/DPX/VP9 stay export-only. encoder: "auto" (prefer hw)
+    // | "software". Returns "" on success, error message otherwise.
+    std::string open (const std::string& outPath, int width, int height,
+                      double fps, const std::string& codec = "h264",
+                      const std::string& encoder = "auto");
+
+    // Pushes one frame. pixels must be strideBytes * height bytes, 8-bit
+    // BGRA (bgra=true, matching the shm ring's payload format — PROTOCOL.md
+    // §Live viewport) or RGBA (bgra=false). Converts to the encoder's pixel
+    // format internally (BT.709 limited-range YUV420P, same as export).
+    std::string pushFrame (const uint8_t* pixels, int strideBytes, bool bgra = true);
+
+    // Flushes the encoder and finalizes the container. Safe to call once;
+    // a session destroyed without close() first is finalized best-effort by
+    // the destructor (error swallowed, matching Region's RAII elsewhere).
+    std::string close();
+
+    bool isOpen() const;
+    int64_t framesEncoded() const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};

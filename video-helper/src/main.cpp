@@ -10,6 +10,7 @@
 // index instead of pixel data.
 
 #include "media.h"
+#include "capture_device.h"
 #include "exporter.h"
 #if ARBIT_HAVE_VIEWPORT
 #include "viewport.h"
@@ -19,6 +20,16 @@
 #include "lua_hook.h"         // P2 Scripts tab: script_compile validation (Lua hook)
 #include "js_hook.h"          // P2 Scripts tab: script_compile validation (JS hook)
 #include "VideoFrameSharedMemory.h"
+
+// rife_selftest RPC: exercises whichever RIFE backend is actually compiled in,
+// so CI can assert real GPU/EP interpolation engaged instead of just ping/version.
+#if defined(ARBIT_HAVE_NCNN)
+#include "rife_ncnn.h"
+namespace arbitselftest { using RifeBackend = arbitrife::RifeEngineNcnn; }
+#elif defined(ARBIT_HAVE_ONNX)
+#include "rife.h"
+namespace arbitselftest { using RifeBackend = arbitrife::RifeEngine; }
+#endif
 
 #include <algorithm>
 
@@ -48,6 +59,62 @@ std::map<uint32_t, std::unique_ptr<MediaContext>> g_media;
 uint32_t g_nextMediaId = 1;
 videoshm::Region g_shm;
 uint32_t g_nextSlot = 0;
+
+// Recorder sessions are independent: each owns the Arbit-provided shared-memory
+// ring and its encoder. A close/cancel moves one entry out of the map before
+// finalization, so it can never close another recording's ring.
+struct RecorderCaptureSession
+{
+    videoshm::Region shm;
+    RecorderSession recorder;
+    std::string outPath;
+};
+std::map<uint32_t, std::unique_ptr<RecorderCaptureSession>> g_recorderSessions;
+std::mutex g_recorderSessionsMutex;
+uint32_t g_nextRecorderSessionId = 1;
+
+struct CaptureEndpoint
+{
+    videoshm::Region shm;
+    CaptureDeviceSession capture;
+    std::mutex frameMutex;
+    uint32_t nextSlot = 0;
+    uint32_t latestSlot = 0;
+};
+std::map<uint32_t, std::shared_ptr<CaptureEndpoint>> g_captureSessions;
+std::mutex g_captureSessionsMutex;
+uint32_t g_nextCaptureSessionId = 1;
+
+void closeAllCaptureSessions()
+{
+    std::map<uint32_t, std::shared_ptr<CaptureEndpoint>> sessions;
+    {
+        const std::lock_guard<std::mutex> lock(g_captureSessionsMutex);
+        sessions.swap(g_captureSessions);
+    }
+    for (auto& [id, session] : sessions)
+    {
+        (void) id;
+        session->capture.close();
+        session->shm.close();
+    }
+}
+
+void cancelAllRecorderSessions()
+{
+    std::map<uint32_t, std::unique_ptr<RecorderCaptureSession>> sessions;
+    {
+        std::lock_guard<std::mutex> lock (g_recorderSessionsMutex);
+        sessions.swap (g_recorderSessions);
+    }
+    for (auto& [id, session] : sessions)
+    {
+        (void) id;
+        session->recorder.close();
+        session->shm.close();
+        std::remove (session->outPath.c_str());
+    }
+}
 #if ARBIT_HAVE_VIEWPORT
 Viewport g_viewport;
 
@@ -565,6 +632,7 @@ std::string parseExportJob (const json& params, ExportJob& job)
         {
             ExportTextOverlay tx;
             tx.textId = t.value ("textId", 0);
+            tx.ownerClipId = t.value ("ownerClipId", -1);
             tx.startSec = t.value ("startSec", 0.0);
             tx.durationSec = t.value ("durationSec", 0.0);
             tx.posX = t.value ("posX", 0.0);
@@ -824,6 +892,38 @@ json handle (const std::string& method, const json& params, std::string& error)
                       { "beatDetection", false } };
 #endif
 
+    if (method == "rife_selftest")
+    {
+#if defined(ARBIT_HAVE_NCNN) || defined(ARBIT_HAVE_ONNX)
+        arbitselftest::RifeBackend rife;
+        std::string initErr = rife.init();
+        if (! initErr.empty())
+            return json { { "ok", false }, { "backend", "" }, { "error", initErr } };
+
+        // Tiny synthetic frame pair (solid red -> solid blue); real inference,
+        // not a representative image, but enough to exercise init+interpolate
+        // end to end on whatever backend/GPU actually engaged.
+        const int w = 64, h = 64;
+        std::vector<uint8_t> frame0 (static_cast<size_t> (w) * h * 4);
+        std::vector<uint8_t> frame1 (static_cast<size_t> (w) * h * 4);
+        for (int i = 0; i < w * h; ++i)
+        {
+            frame0[i * 4 + 0] = 255; frame0[i * 4 + 1] = 0;   frame0[i * 4 + 2] = 0;   frame0[i * 4 + 3] = 255;
+            frame1[i * 4 + 0] = 0;   frame1[i * 4 + 1] = 0;   frame1[i * 4 + 2] = 255; frame1[i * 4 + 3] = 255;
+        }
+        std::vector<uint8_t> out;
+        std::string interpErr = rife.interpolate (frame0.data(), w * 4, frame1.data(), w * 4,
+                                                   w, h, 0.5f, out);
+        if (! interpErr.empty())
+            return json { { "ok", false }, { "backend", rife.backend() }, { "error", interpErr } };
+
+        return json { { "ok", true }, { "backend", rife.backend() },
+                      { "outputBytes", static_cast<int> (out.size()) } };
+#else
+        return json { { "ok", false }, { "backend", "" }, { "error", "no RIFE backend compiled in" } };
+#endif
+    }
+
     if (method == "open" || method == "probe")
     {
         if (! params.contains ("path")) { error = "missing path"; return {}; }
@@ -915,6 +1015,212 @@ json handle (const std::string& method, const json& params, std::string& error)
         return json { { "slot", slotIndex }, { "ptsSec", df.ptsSec },
                       { "width", df.width }, { "height", df.height },
                       { "strideBytes", df.strideBytes } };
+    }
+
+    if (method == "capture_list_sources")
+    {
+        std::string captureError;
+        const auto devices = listCaptureDevices (params.value ("kind", std::string()), captureError);
+        json sources = json::array();
+        for (const auto& device : devices)
+            sources.push_back ({ { "id", device.id }, { "name", device.name },
+                                 { "kind", device.kind }, { "backend", device.backend },
+                                 { "availableFormats", json::array() } });
+        return json { { "sources", sources }, { "enumerationError", captureError } };
+    }
+
+    if (method == "capture_preview_open")
+    {
+        for (const auto* required : { "sourceId", "backend", "shmName" })
+            if (! params.contains(required)) { error = std::string("missing ") + required; return {}; }
+        auto endpoint = std::make_shared<CaptureEndpoint>();
+        if (! endpoint->shm.open(params["shmName"].get<std::string>()))
+        {
+            error = "cannot open capture shared memory region";
+            return {};
+        }
+        const uint32_t captureId = g_nextCaptureSessionId++;
+        const int width = params.value("width", 640);
+        const int height = params.value("height", 360);
+        const double fps = params.value("fps", 30.0);
+        auto openError = endpoint->capture.open(params["sourceId"].get<std::string>(),
+            params["backend"].get<std::string>(), width, height, fps,
+            [endpoint, captureId] (const uint8_t* pixels, const CaptureFrameInfo& frame)
+            {
+                const std::lock_guard<std::mutex> lock(endpoint->frameMutex);
+                auto* header = endpoint->shm.header();
+                if (header == nullptr) return;
+                const size_t bytes = static_cast<size_t>(frame.strideBytes) * static_cast<size_t>(frame.height);
+                if (bytes == 0 || bytes > header->slotBytes) return;
+                const uint32_t slotIndex = endpoint->nextSlot++ % header->slotCount;
+                auto* slot = endpoint->shm.slot(slotIndex);
+                auto* payload = endpoint->shm.slotPayload(slotIndex);
+                if (slot == nullptr || payload == nullptr) return;
+                slot->generation.fetch_add(1, std::memory_order_acq_rel);
+                slot->width = static_cast<uint32_t>(frame.width);
+                slot->height = static_cast<uint32_t>(frame.height);
+                slot->strideBytes = static_cast<uint32_t>(frame.strideBytes);
+                slot->ptsSec = frame.timestampSec;
+                slot->mediaId = captureId;
+                std::memcpy(payload, pixels, bytes);
+                slot->generation.fetch_add(1, std::memory_order_acq_rel);
+                endpoint->latestSlot = slotIndex;
+            });
+        if (! openError.empty())
+        {
+            endpoint->shm.close();
+            error = openError;
+            return {};
+        }
+        {
+            const std::lock_guard<std::mutex> lock(g_captureSessionsMutex);
+            g_captureSessions[captureId] = endpoint;
+        }
+        return json { { "captureId", captureId } };
+    }
+
+    if (method == "capture_preview_latest")
+    {
+        if (! params.contains("captureId")) { error = "missing captureId"; return {}; }
+        std::shared_ptr<CaptureEndpoint> endpoint;
+        {
+            const std::lock_guard<std::mutex> lock(g_captureSessionsMutex);
+            const auto found = g_captureSessions.find(params["captureId"].get<uint32_t>());
+            if (found == g_captureSessions.end()) { error = "unknown captureId"; return {}; }
+            endpoint = found->second;
+        }
+        const auto frame = endpoint->capture.latestFrame();
+        if (frame.sequence == 0)
+        {
+            const auto captureError = endpoint->capture.lastError();
+            if (! captureError.empty()) { error = captureError; return {}; }
+            return json { { "pending", true } };
+        }
+        const std::lock_guard<std::mutex> lock(endpoint->frameMutex);
+        return json { { "slot", endpoint->latestSlot }, { "sequence", frame.sequence },
+                      { "timestampSec", frame.timestampSec }, { "width", frame.width },
+                      { "height", frame.height }, { "strideBytes", frame.strideBytes } };
+    }
+
+    if (method == "capture_record_start" || method == "capture_record_stop")
+    {
+        if (! params.contains("captureId") || ! params.contains("recordingId"))
+        { error = "missing captureId or recordingId"; return {}; }
+        std::shared_ptr<CaptureEndpoint> endpoint;
+        {
+            const std::lock_guard<std::mutex> lock(g_captureSessionsMutex);
+            const auto found = g_captureSessions.find(params["captureId"].get<uint32_t>());
+            if (found == g_captureSessions.end()) { error = "unknown captureId"; return {}; }
+            endpoint = found->second;
+        }
+        const uint32_t recordingId = params["recordingId"].get<uint32_t>();
+        if (method == "capture_record_start")
+        {
+            if (! params.contains("outPath")) { error = "missing outPath"; return {}; }
+            error = endpoint->capture.startRecording(recordingId, params["outPath"].get<std::string>(),
+                                                       params.value("codec", std::string("h264")));
+        }
+        else
+            error = endpoint->capture.stopRecording(recordingId, params.value("cancel", false));
+        if (! error.empty()) return {};
+        return json { { "ok", true } };
+    }
+
+    if (method == "capture_close")
+    {
+        if (! params.contains("captureId")) { error = "missing captureId"; return {}; }
+        std::shared_ptr<CaptureEndpoint> endpoint;
+        {
+            const std::lock_guard<std::mutex> lock(g_captureSessionsMutex);
+            const auto found = g_captureSessions.find(params["captureId"].get<uint32_t>());
+            if (found == g_captureSessions.end()) return json { { "ok", true } };
+            endpoint = found->second;
+            g_captureSessions.erase(found);
+        }
+        endpoint->capture.close();
+        endpoint->shm.close();
+        return json { { "ok", true } };
+    }
+
+    // Recorder protocol v2: every operation is scoped to an explicit recordingId.
+    if (method == "record_open")
+    {
+        if (! params.contains ("shmName")) { error = "missing shmName"; return {}; }
+        if (! params.contains ("outPath")) { error = "missing outPath"; return {}; }
+
+        auto session = std::make_unique<RecorderCaptureSession>();
+        if (! session->shm.open (params["shmName"].get<std::string>()))
+        {
+            error = "cannot open recorder shared memory region";
+            return {};
+        }
+        session->outPath = params["outPath"].get<std::string>();
+        error = session->recorder.open (session->outPath,
+                                        params.value ("width", 1920),
+                                        params.value ("height", 1080),
+                                        params.value ("fps", 30.0),
+                                        params.value ("codec", std::string ("h264")),
+                                        params.value ("encoder", std::string ("auto")));
+        if (! error.empty())
+        {
+            session->shm.close();
+            return {};
+        }
+
+        std::lock_guard<std::mutex> lock (g_recorderSessionsMutex);
+        const uint32_t recordingId = g_nextRecorderSessionId++;
+        g_recorderSessions.emplace (recordingId, std::move (session));
+        return json { { "ok", true }, { "recordingId", recordingId } };
+    }
+
+    if (method == "record_push_frame")
+    {
+        if (! params.contains ("recordingId")) { error = "missing recordingId"; return {}; }
+        if (! params.contains ("slot")) { error = "missing slot"; return {}; }
+        std::lock_guard<std::mutex> lock (g_recorderSessionsMutex);
+        const auto it = g_recorderSessions.find (params["recordingId"].get<uint32_t>());
+        if (it == g_recorderSessions.end()) { error = "unknown recordingId"; return {}; }
+        auto& session = *it->second;
+        if (! session.shm.isOpen() || ! session.recorder.isOpen())
+        {
+            error = "recording session not open";
+            return {};
+        }
+
+        const uint32_t slotIndex = params["slot"].get<uint32_t>();
+        auto* h = session.shm.header();
+        if (h == nullptr) { error = "recorder shm not attached"; return {}; }
+        std::vector<uint8_t> pixels (h->slotBytes);
+        uint32_t width = 0, height = 0, strideBytes = 0;
+        double ptsSec = 0.0;
+        if (! session.shm.readSlot (slotIndex, width, height, strideBytes, ptsSec,
+                                    pixels.data(), pixels.size()))
+        {
+            error = "recorder slot torn or invalid (dropped frame, caller may retry)";
+            return {};
+        }
+        error = session.recorder.pushFrame (pixels.data(), (int) strideBytes, /*bgra*/ true);
+        if (! error.empty()) return {};
+        return json { { "ok", true }, { "framesEncoded", session.recorder.framesEncoded() } };
+    }
+
+    if (method == "record_close" || method == "record_cancel")
+    {
+        if (! params.contains ("recordingId")) { error = "missing recordingId"; return {}; }
+        std::unique_ptr<RecorderCaptureSession> session;
+        {
+            std::lock_guard<std::mutex> lock (g_recorderSessionsMutex);
+            const auto it = g_recorderSessions.find (params["recordingId"].get<uint32_t>());
+            if (it == g_recorderSessions.end()) { error = "unknown recordingId"; return {}; }
+            session = std::move (it->second);
+            g_recorderSessions.erase (it);
+        }
+        error = session->recorder.close();
+        session->shm.close();
+        if (! error.empty()) return {};
+        if (method == "record_cancel")
+            std::remove (session->outPath.c_str());
+        return json { { "ok", true } };
     }
 
     if (method == "extract_audio")
@@ -1567,7 +1873,8 @@ json handle (const std::string& method, const json& params, std::string& error)
                                          params.value ("posX", 0.0),
                                          params.value ("posY", 0.0),
                                          params.value ("opacity", 1.0),
-                                         params.value ("zOrder", 0.0));
+                                         params.value ("zOrder", 0.0),
+                                         params.value ("ownerClipId", -1));
         if (! error.empty()) return {};
         return json { { "ok", true } };
     }
@@ -1677,6 +1984,8 @@ json handle (const std::string& method, const json& params, std::string& error)
             if (g_renderCache.worker.joinable())
                 g_renderCache.worker.join();
         }
+        closeAllCaptureSessions();
+        cancelAllRecorderSessions();
         reply (json(), json { { "ok", true } });
         std::exit (0);
     }
@@ -1689,6 +1998,14 @@ json handle (const std::string& method, const json& params, std::string& error)
 int main()
 {
     av_log_set_level (AV_LOG_ERROR);
+
+    // Initialize the shared CUDA hardware-decode context ONCE, single-threaded,
+    // before any worker/render thread spawns. Doing CUDA init up front here is
+    // what makes hw decode safe on the live paths (viewport render thread +
+    // InterpEngine worker): the old per-context creation deadlocked the NVIDIA
+    // driver when two threads called cuInit() concurrently. No-op (returns
+    // nullptr) on machines without NVIDIA or when ARBIT_DISABLE_HWDEC is set.
+    sharedCudaDeviceCtx();
 
 #if defined(_WIN32)
     // Binary-safe stdio on Windows.
@@ -1753,5 +2070,7 @@ int main()
         if (g_renderCache.worker.joinable())
             g_renderCache.worker.join();
     }
+    closeAllCaptureSessions();
+    cancelAllRecorderSessions();
     return 0;
 }

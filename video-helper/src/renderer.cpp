@@ -1852,6 +1852,19 @@ unsigned FrameRenderer::renderComposite (const LayerDesc* layers, int numLayers,
     glClearColor (bgR_, bgG_, bgB_, bgA_);   // M1 canvas background param (default charcoal)
     glClear (GL_COLOR_BUFFER_BIT);
 
+    std::vector<bool> overlayComposited ((size_t) std::max (numOverlays, 0), false);
+    auto compositeOverlay = [&] (int overlayIndex)
+    {
+        const ImageLayerDesc& ov = overlays[overlayIndex];
+        if (ov.texture == 0 || ov.opacity <= 0.0f)
+            return;
+        drawImageOverlay (ov, layerTexB_);
+        blendOnto (layerTexB_, accumTex_[read], accumTex_[read ^ 1],
+                   ov.opacity, 0 /* normal */);
+        read ^= 1;
+        overlayComposited[(size_t) overlayIndex] = true;
+    };
+
     for (int i = 0; i < numLayers; ++i)
     {
         const LayerDesc& layer = layers[i];
@@ -1871,6 +1884,17 @@ unsigned FrameRenderer::renderComposite (const LayerDesc* layers, int numLayers,
         // early-returns the accumulator → an opacity-1 no-op (masked) copy.
         if (layer.isAdjustment)
         {
+            // Text created while this adjustment clip was selected belongs to
+            // the adjusted composite, not to a detached top-level pass. Insert
+            // it immediately before the adjustment so transform/crop/mask,
+            // effects, opacity, and their automation process text and video as
+            // one image. Project text and text owned by normal clips remain in
+            // the ordinary top overlay pass below.
+            for (int ov = 0; ov < numOverlays; ++ov)
+                if (! overlayComposited[(size_t) ov]
+                    && overlays[ov].ownerClipId == layer.clipId)
+                    compositeOverlay (ov);
+
             LayerDesc adj = layer;
             adj.texture        = accumTex_[read];
             adj.texWidth       = outW_;
@@ -1948,13 +1972,8 @@ unsigned FrameRenderer::renderComposite (const LayerDesc* layers, int numLayers,
 
     for (int i = 0; i < numOverlays; ++i)
     {
-        const ImageLayerDesc& ov = overlays[i];
-        if (ov.texture == 0 || ov.opacity <= 0.0f)
-            continue;
-        drawImageOverlay (ov, layerTexB_);
-        blendOnto (layerTexB_, accumTex_[read], accumTex_[read ^ 1],
-                   ov.opacity, 0 /* normal */);
-        read ^= 1;
+        if (! overlayComposited[(size_t) i])
+            compositeOverlay (i);
     }
 
     // HDR post stack (bloom + tonemap) over the final composite. Neutral by

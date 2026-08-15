@@ -299,7 +299,7 @@ public:
     // parsed but v1 only implements immediate + linear-at-frame-rate
     // application. v2 nodes: "transform2d" (incl. crop), "source" (incl.
     // blendMode), "effect<slot>" (type/enabled/<wire param name>, slots 0-7).
-    // Text params: opacity, translateX, translateY, visible, zOrder.
+    // Text params: opacity, posX, posY, translateX, translateY, visible, zOrder.
     std::string setParam (const std::string& paramId, double value, double atBeat);
 
     // Text overlays (PROTOCOL.md §Text overlays). Arbit rasterizes the text
@@ -313,7 +313,8 @@ public:
                               int width, int height,
                               double startSec, double durationSec,
                               double posX, double posY,
-                              double opacity, double zOrder);
+                              double opacity, double zOrder,
+                              int ownerClipId = -1);
     std::string removeText (int textId);
 
     // Bulk (re)configure a clip's whole effects rack (graph_set_effects).
