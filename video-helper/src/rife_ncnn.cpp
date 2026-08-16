@@ -123,10 +123,10 @@ namespace
     struct RifeFile { const char* name; const char* url; const char* sha256; int64_t bytes; };
     const RifeFile kRifeFiles[] = {
         { "flownet.param",
-          "https://donutsdelivery.online/download-arbit/files/video-helper/models/rife-v4.6/flownet.param",
+          "https://raw.githubusercontent.com/nihui/rife-ncnn-vulkan/a7532fc3f9f8f008cd6eecd6f2ffe2a9698e0cf7/models/rife-v4.6/flownet.param",
           "724569596bcd1e7b9fa50455c604777ebed99746d2ef40aa86e31b5725f1053c", 16532 },
         { "flownet.bin",
-          "https://donutsdelivery.online/download-arbit/files/video-helper/models/rife-v4.6/flownet.bin",
+          "https://raw.githubusercontent.com/nihui/rife-ncnn-vulkan/a7532fc3f9f8f008cd6eecd6f2ffe2a9698e0cf7/models/rife-v4.6/flownet.bin",
           "f334ed2260149ce0188a6dcf049844e8b0cdd912e01cbcfb63553157d2508958", 10614320 },
     };
 

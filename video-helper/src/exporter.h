@@ -25,35 +25,13 @@
 #include <utility>
 #include <vector>
 
-#include "mod_defs.h"   // arbitmod::Score — Block C (M5) score; dependency-free, no GL/GPL
+#include "mod_defs.h"       // arbitmod::Score — Block C (M5); dependency-free
+#include "beat_timeline.h"  // authoritative tempo/meter mapping; dependency-free
+#include "video_control_plan.h"
+#include "render_snapshot.h"
+#include "visual_plan_telemetry.h"
 
-struct ExportSegment
-{
-    std::string sourcePath;
-    int clipId = 0;              // render-graph clip this slice belongs to
-    int trackLayer = 0;          // compositing layer (same as viewport v2)
-    double inSec = 0.0;          // source media time at segment start
-    double outSec = 0.0;         // source media time at segment end
-    double rate = 1.0;           // media seconds advanced per display second
-    double displayStartSec = 0.0;
-    int transitionType = 0;      // videofx::TransitionType on the LEADING edge
-    double transitionDurationSec = 0.0;
-    double sourceFps = 0.0;      // image sequences: pattern frame rate
-                                 // (0 = not a sequence / demuxer default)
-    int seqStart = -1;           // image sequences: first frame number
-    // Retime quality ladder (per-clip, uniform across its segments): 0 Nearest,
-    // 1 Frame Blend, 2 Speed Warp (RIFE). The live viewport honors this per clip
-    // (viewport.cpp:1400/1446); the export must too, or what the user previewed
-    // (smooth interpolation) exports as nearest-frame judder (audit #2/#5).
-    int retimeQuality = 0;
-    // AI roto (Epic C): an alpha-matte image sequence (matte_%06d.png, frame N ==
-    // source frame N) baked by the segmentation sidecar. When set, the renderer
-    // multiplies each decoded source frame's alpha by the matte before
-    // compositing, so the clip carries the isolated subject. Empty = no matte.
-    std::string matteDir;        // directory holding matte_%06d.png
-    double matteFps = 0.0;       // matte sequence frame rate (= source fps)
-    int matteFrames = 0;         // matte frame count (for clamping)
-};
+using ExportSegment = videowire::RenderSegment;
 
 // One effects-rack slot (mirrors graph_set_effects).
 struct ExportEffectSlot
@@ -154,11 +132,15 @@ struct ExportTextOverlay
 
 struct ExportJob
 {
+    // Helper-startup capability; never parsed from RPC jobSpec.
+    std::string depthCacheRoot;
     std::string outPath;
+    uint64_t authoringRevision = 0;
+    uint64_t exportableRevision = 0;
     int width = 1920;
     int height = 1080;
     double fps = 30.0;
-    std::string codec = "h264";          // h264 | h265 | vp9 | prores
+    std::string codec = "h264";          // h264 | h265 | vp9 | prores | ffv1
     std::string proresProfile = "hq";    // when codec==prores: hq (422 HQ) | 4444 | 4444xq
     std::string encoder = "auto";        // auto | software | nvenc | videotoolbox
     std::string interpolation = "none";  // none | minterpolate | rife | auto
@@ -195,12 +177,12 @@ struct ExportJob
     // The plugin supplies a beats-derived value (default 8 beats); 0 = off.
     double feedbackPreRollSec = 0.0;
 
-    // Tempo for the shader-generator clock (M3). Shader generators derive their
-    // Block A beat uniforms from display time and a constant tempo (v1: no
-    // tempo map). Viewport and export use the same formula (makeShaderClock) so
-    // a beat-synced shader exports identically to preview.
+    // Legacy scalar fallbacks remain on the wire for older callers. beatTimeline
+    // is authoritative whenever tempoMap/timeSignatureMap are present and is used
+    // by every score, modulation, script, shader, seek, and warm-up clock path.
     double bpm = 120.0;
     double beatsPerBar = 4.0;
+    videotime::BeatTimeline beatTimeline;
 
     // Canvas background colour (M1 "canvas background param"): RGBA 0..1 the
     // composite is cleared to beneath all layers. Default = editor charcoal, so
@@ -221,6 +203,8 @@ struct ExportJob
     } post;
 
     std::vector<ExportSegment> segments; // sorted by displayStartSec
+    std::vector<videowire::CompiledVisualLayerPlan> visualLayerPlans;
+    std::vector<videowire::VisualEventScheduleBinding> visualEventSchedules;
 
     std::vector<ExportClipState> clips;        // static graph state per clip
     std::vector<ExportParamSample> paramTimeline; // baked automation
@@ -260,6 +244,7 @@ struct ExportJob
     // byte-identical to a no-modMatrix job. Parsed even in non-viewport builds
     // (mod_defs.h is plain C++17, no GL/GPL); only consumed by the GL frame loop.
     std::vector<arbitmod::Routing> routings;
+    videocontrol::Plan controlPlan;
 
     // Per-frame Lua hook (M8 — "agent-programmable media machine"). A single
     // script defining a global `frame(ctx)` that returns a table of
@@ -281,6 +266,8 @@ struct ExportJob
     // is active per job. Inert (no-op) in builds without QuickJS.
     std::string jsScript;
     std::string scriptLang;
+    uint32_t scriptCpuMs = 0;
+    uint32_t scriptMemoryMiB = 0;
 };
 
 // Live progress/cancel state shared between the export worker thread and
@@ -295,6 +282,7 @@ struct ExportProgress
     std::atomic<double> encodeFps { 0.0 };  // wall-clock encode rate
     std::atomic<int> phase { 0 };
     std::atomic<bool> abort { false };      // set by export_cancel
+    videowire::VisualPlanTelemetry visualTelemetry;
 };
 
 // Returns empty string on success, error message on failure. A cancelled
@@ -311,6 +299,20 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
                        bool& glCompositingOut,
                        std::string& interpolationBackendOut,
                        ExportProgress* progress = nullptr);
+
+struct CompositeFrameResult
+{
+    std::vector<uint8_t> rgba;
+    int width = 0;
+    int height = 0;
+    std::string compositorBackend;
+    std::string presentationBackend;
+};
+
+// Render one exact display-timeline frame through the production offscreen
+// compositor used by export. No output path is accepted or created.
+std::string renderCompositeFrame (const ExportJob& job, double timelineSec,
+                                  CompositeFrameResult& result);
 
 // RecorderSession — push-frame video-only encode session, for the live
 // piano-roll recorder (record_open / record_push_frame / record_close RPCs).

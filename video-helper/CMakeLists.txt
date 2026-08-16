@@ -10,8 +10,33 @@
 cmake_minimum_required(VERSION 3.22)
 project(arbit-video-helper VERSION 0.1.0 LANGUAGES C CXX)  # C for vendored QuickJS-ng
 
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+execute_process(
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../tools/generate_shader_catalog_manifest.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/../content/shader-packs
+            ${CMAKE_CURRENT_SOURCE_DIR}/../shared/ShaderCatalogManifest.h --check
+    RESULT_VARIABLE ARBIT_SHADER_CATALOG_CHECK_RESULT)
+if(NOT ARBIT_SHADER_CATALOG_CHECK_RESULT EQUAL 0)
+    message(FATAL_ERROR "ShaderCatalogManifest.h is stale; regenerate it before building")
+endif()
+add_custom_target(arbit-shader-catalog-check ALL
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../tools/generate_shader_catalog_manifest.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/../content/shader-packs
+            ${CMAKE_CURRENT_SOURCE_DIR}/../shared/ShaderCatalogManifest.h --check
+    COMMENT "Checking generated shader catalog manifest"
+    VERBATIM)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+if(APPLE)
+    option(ARBIT_WITH_METAL "Enable the native sokol_gfx Metal backend" ON)
+    if(ARBIT_WITH_METAL)
+        enable_language(OBJCXX)
+    endif()
+endif()
 
 # Hardware accel: the decoder tries NVDEC/VAAPI (Linux), D3D11VA/NVDEC
 # (Windows), VideoToolbox (macOS) at runtime and falls back to software.
@@ -55,6 +80,11 @@ endif()
 # it the helper builds headless and the viewport_* methods return an error.
 pkg_check_modules(GLFW3 IMPORTED_TARGET glfw3)
 find_package(OpenGL QUIET)
+option(ARBIT_REQUIRE_VIEWPORT "Fail configure when the production viewport cannot be built" OFF)
+if(ARBIT_REQUIRE_VIEWPORT AND NOT (GLFW3_FOUND AND OpenGL_FOUND))
+    message(FATAL_ERROR
+        "ARBIT_REQUIRE_VIEWPORT=ON requires GLFW3 and OpenGL; refusing a headless shipping helper")
+endif()
 
 add_executable(arbit-video-helper
     src/main.cpp
@@ -62,6 +92,21 @@ add_executable(arbit-video-helper
     src/media.cpp
     src/exporter.cpp
 )
+add_dependencies(arbit-video-helper arbit-shader-catalog-check)
+
+# Visual-engine P6 foundation: a language-neutral native-backend seam plus a
+# real compute/offscreen-render self-test.  FrameRenderer remains GL-backed
+# until the subsequent migration slices route its passes through this seam.
+if(APPLE AND ARBIT_WITH_METAL)
+    target_sources(arbit-video-helper PRIVATE src/gpu_backend/backend_sokol.mm)
+    target_include_directories(arbit-video-helper PRIVATE third_party/sokol)
+    target_link_libraries(arbit-video-helper PRIVATE
+        "-framework Metal" "-framework QuartzCore" "-framework Cocoa")
+    target_compile_definitions(arbit-video-helper PRIVATE ARBIT_HAVE_METAL_BACKEND=1)
+    message(STATUS "arbit-video-helper: native sokol_gfx Metal backend enabled")
+else()
+    target_sources(arbit-video-helper PRIVATE src/gpu_backend/backend_stub.cpp)
+endif()
 
 if(GLFW3_FOUND AND OpenGL_FOUND)
     target_sources(arbit-video-helper PRIVATE
@@ -80,14 +125,17 @@ if(GLFW3_FOUND AND OpenGL_FOUND)
     # extensions, context flavor) is probed at runtime and
     # viewport_open_shared fails cleanly without it.
     if(APPLE)
-        # IOSurface + CGLTexImageIOSurface2D (global IOSurfaceIDs — no fd
-        # passing). OpenGL framework comes in via find_package above.
-        target_sources(arbit-video-helper PRIVATE
-            src/gpu_export_iosurface.cpp
-            src/fd_socket.cpp)
-        target_link_libraries(arbit-video-helper PRIVATE
-            "-framework IOSurface" "-framework CoreFoundation")
-        target_compile_definitions(arbit-video-helper PRIVATE ARBIT_HAVE_IOSURFACE=1)
+        if(ARBIT_WITH_METAL)
+            # IOSurface-backed native Metal targets (global IOSurfaceIDs — no
+            # fd passing). The shared path creates no OpenGL context.
+            target_sources(arbit-video-helper PRIVATE
+                src/mac_metal_viewport_surface.mm
+                src/gpu_export_iosurface.cpp
+                src/fd_socket.cpp)
+            target_link_libraries(arbit-video-helper PRIVATE
+                "-framework IOSurface" "-framework CoreFoundation")
+            target_compile_definitions(arbit-video-helper PRIVATE ARBIT_HAVE_IOSURFACE=1)
+        endif()
     elseif(WIN32)
         # D3D11 keyed-mutex shared textures bridged into GL via
         # WGL_NV_DX_interop2; socket is AF_UNIX SOCK_STREAM (Winsock).
@@ -231,15 +279,18 @@ option(ARBIT_WITH_NCNN "Enable portable RIFE frame interpolation via ncnn + Vulk
 # Vulkan headers (ncnn's in-house simplevk.h lacks the external-memory structs) and
 # the Vulkan loader at link time, and makes libvulkan a HARD runtime dependency
 # (vs the SIMPLEVK soft-dlopen). The export path itself (OPAQUE_FD -> GL) is
-# Linux-specific (macOS would need IOSurface, Windows DXGI — not built), so this
-# defaults ON only on Linux and OFF elsewhere. Set OFF for a stripped Linux build
-# that keeps only the portable CPU-readback RIFE path (no Vulkan headers/loader).
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    set(_arbit_zerocopy_default ON)
-else()
-    set(_arbit_zerocopy_default OFF)
-endif()
+# Linux-specific (macOS would need IOSurface, Windows DXGI — not built). It remains
+# fail-closed until ncnn exposes a legal asynchronous submission API; the portable
+# synchronous CPU-readback RIFE path stays available.
+set(_arbit_zerocopy_default OFF)
 option(ARBIT_NCNN_ZEROCOPY "Zero-copy GPU RIFE output (Vulkan->GL OPAQUE_FD, Linux)" ${_arbit_zerocopy_default})
+if(ARBIT_NCNN_ZEROCOPY)
+    message(FATAL_ERROR
+        "ARBIT_NCNN_ZEROCOPY is blocked: pinned ncnn 20250503 exposes only "
+        "VkCompute::submit_and_wait(), so external wait/signal semaphores and "
+        "per-submission completion cannot be attached legally. See "
+        "artifacts/media-machine/rife-ncnn-async-submission-blocker.md.")
+endif()
 if(ARBIT_WITH_NCNN)
     include(FetchContent)
     # ncnn build knobs: Vulkan on, static, no extras, bundle+build glslang.
@@ -353,7 +404,23 @@ if(ARBIT_WITH_NCNN)
         ${ARBIT_RIFE_NET} ${ARBIT_RIFE_SHADER_DIR})
     target_link_libraries(arbit-video-helper PRIVATE ncnn)
     target_compile_definitions(arbit-video-helper PRIVATE ARBIT_HAVE_NCNN=1)
+
+    add_executable(rife-ncnn-inference-tests
+        tests/rife_ncnn_inference_tests.cpp
+        ${ARBIT_RIFE_NET}/rife.cpp
+        ${ARBIT_RIFE_NET}/warp.cpp
+        src/rife_ncnn.cpp)
+    add_dependencies(rife-ncnn-inference-tests arbit-rife-shaders)
+    target_include_directories(rife-ncnn-inference-tests PRIVATE
+        src ${ARBIT_RIFE_NET} ${ARBIT_RIFE_SHADER_DIR})
+    target_link_libraries(rife-ncnn-inference-tests PRIVATE ncnn PkgConfig::AV)
+    target_compile_definitions(rife-ncnn-inference-tests PRIVATE ARBIT_HAVE_NCNN=1)
+    if(NOT MSVC)
+        target_compile_options(rife-ncnn-inference-tests PRIVATE -Wall -Wextra)
+    endif()
     if(ARBIT_NCNN_ZEROCOPY)
+        target_compile_definitions(rife-ncnn-inference-tests PRIVATE ARBIT_RIFE_ZEROCOPY=1)
+        target_link_libraries(rife-ncnn-inference-tests PRIVATE Vulkan::Headers)
         # rife_ncnn.cpp's ExportableRing + rife.cpp's process_v4_to_buffer include
         # <vulkan/vulkan.h> (via ncnn's PUBLIC Vulkan::Vulkan) and use the external-
         # memory API. The GL import side is loaded at runtime via the viewport's GL
@@ -449,6 +516,56 @@ else()
     message(STATUS "arbit-video-helper: SPIRV-Cross not vendored — SPIR-V ingestion disabled")
 endif()
 
+# Strict macOS generator path: compile the same wrapped GLSL contract to SPIR-V
+# with glslang, convert it to MSL in-process, and render into private Metal
+# textures sampled directly by the compositor. MoltenVK's converter is static,
+# so the installed helper does not launch or depend on a developer tool.
+if(APPLE AND ARBIT_WITH_METAL AND GLFW3_FOUND AND OpenGL_FOUND)
+    if(NOT ARBIT_WITH_NCNN)
+        message(FATAL_ERROR "The native Metal generator path requires bundled glslang (ARBIT_WITH_NCNN=ON)")
+    endif()
+    find_path(ARBIT_MVK_SHADER_CONVERTER_INCLUDE
+        NAMES MoltenVKShaderConverter/SPIRVConversion.h)
+    find_library(ARBIT_MVK_SHADER_CONVERTER_LIBRARY
+        NAMES MoltenVKShaderConverter
+        PATH_SUFFIXES
+            Frameworks/MoltenVKShaderConverter.xcframework/macos-arm64
+            Frameworks/MoltenVKShaderConverter.xcframework/macos-x86_64)
+    find_program(ARBIT_MVK_SHADER_CONVERTER_TOOL NAMES MoltenVKShaderConverter)
+    if(ARBIT_MVK_SHADER_CONVERTER_TOOL)
+        get_filename_component(ARBIT_MVK_SHADER_CONVERTER_TOOL_REAL
+            ${ARBIT_MVK_SHADER_CONVERTER_TOOL} REALPATH)
+        get_filename_component(ARBIT_MVK_BIN_DIR
+            ${ARBIT_MVK_SHADER_CONVERTER_TOOL_REAL} DIRECTORY)
+        get_filename_component(ARBIT_MVK_PREFIX ${ARBIT_MVK_BIN_DIR} DIRECTORY)
+    endif()
+    find_library(ARBIT_MVK_SPIRV_CROSS_LIBRARY NAMES SPIRVCross
+        HINTS ${ARBIT_MVK_PREFIX}/libexec/lib
+        PATH_SUFFIXES libexec/lib)
+    find_library(ARBIT_MVK_SPIRV_TOOLS_LIBRARY NAMES SPIRVTools
+        HINTS ${ARBIT_MVK_PREFIX}/libexec/lib
+        PATH_SUFFIXES libexec/lib)
+    if(NOT ARBIT_MVK_SHADER_CONVERTER_INCLUDE
+       OR NOT ARBIT_MVK_SHADER_CONVERTER_LIBRARY
+       OR NOT ARBIT_MVK_SPIRV_CROSS_LIBRARY
+       OR NOT ARBIT_MVK_SPIRV_TOOLS_LIBRARY)
+        message(FATAL_ERROR
+            "Strict Metal generators require MoltenVKShaderConverter and its static SPIR-V libraries")
+    endif()
+
+    target_sources(arbit-video-helper PRIVATE src/gpu_backend/metal_shader_generator.mm)
+    target_include_directories(arbit-video-helper PRIVATE
+        ${ARBIT_MVK_SHADER_CONVERTER_INCLUDE}
+        ${ncnn_SOURCE_DIR}/glslang)
+    target_compile_definitions(arbit-video-helper PRIVATE ARBIT_HAVE_METAL_GENERATORS=1)
+    target_link_libraries(arbit-video-helper PRIVATE
+        glslang SPIRV glslang-default-resource-limits
+        ${ARBIT_MVK_SHADER_CONVERTER_LIBRARY}
+        ${ARBIT_MVK_SPIRV_CROSS_LIBRARY}
+        ${ARBIT_MVK_SPIRV_TOOLS_LIBRARY}
+        "-framework Foundation")
+endif()
+
 if(WIN32)
     # windows.h (pulled in by VideoFrameSharedMemory.h / gl_loader.h) defines
     # min/max macros that break std::min/std::max.
@@ -480,7 +597,347 @@ if(NOT MSVC)
 endif()
 add_test(NAME video_param_grammar COMMAND arbit-video-param-tests)
 
-find_package(Python3 COMPONENTS Interpreter QUIET)
+add_executable(arbit-beat-timeline-tests tests/beat_timeline_tests.cpp)
+target_include_directories(arbit-beat-timeline-tests PRIVATE src)
+if(NOT MSVC)
+    target_compile_options(arbit-beat-timeline-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME beat_timeline COMMAND arbit-beat-timeline-tests)
+
+add_executable(arbit-video-control-plan-tests tests/video_control_plan_tests.cpp)
+target_include_directories(arbit-video-control-plan-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_features(arbit-video-control-plan-tests PRIVATE cxx_std_17)
+if(MSVC)
+  target_compile_options(arbit-video-control-plan-tests PRIVATE /W4)
+else()
+  target_compile_options(arbit-video-control-plan-tests PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+add_test(NAME video_control_plan COMMAND arbit-video-control-plan-tests)
+
+add_test(NAME depth_primitives_source_contract
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/depth_primitives_source_contract.py)
+add_test(NAME rife_ncnn_async_submission_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/rife_ncnn_async_submission_source_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(arbit-source-binding-tests tests/source_binding_tests.cpp)
+target_include_directories(arbit-source-binding-tests PRIVATE src)
+if(NOT MSVC)
+    target_compile_options(arbit-source-binding-tests PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME source_binding COMMAND arbit-source-binding-tests)
+
+add_executable(arbit-render-snapshot-tests tests/render_snapshot_tests.cpp)
+target_include_directories(arbit-render-snapshot-tests PRIVATE src)
+target_link_libraries(arbit-render-snapshot-tests PRIVATE nlohmann_json::nlohmann_json)
+if(NOT MSVC)
+    target_compile_options(arbit-render-snapshot-tests PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME render_snapshot COMMAND arbit-render-snapshot-tests)
+
+add_executable(programmable-admission-tests tests/programmable_admission_tests.cpp)
+add_dependencies(programmable-admission-tests arbit-shader-catalog-check)
+target_include_directories(programmable-admission-tests PRIVATE src)
+target_compile_definitions(programmable-admission-tests PRIVATE
+    SHADER_CATALOG_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../content/shader-packs")
+target_link_libraries(programmable-admission-tests PRIVATE nlohmann_json::nlohmann_json)
+if(NOT MSVC)
+    target_compile_options(programmable-admission-tests PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME programmable_admission COMMAND programmable-admission-tests)
+set_tests_properties(programmable_admission PROPERTIES TIMEOUT 30)
+
+option(ARBIT_PROGRAMMABLE_TEST_MODE "Enable private programmable-runtime test diagnostics" OFF)
+if(ARBIT_PROGRAMMABLE_TEST_MODE)
+    target_compile_definitions(arbit-video-helper PRIVATE ARBIT_PROGRAMMABLE_TEST_MODE=1)
+endif()
+
+if(UNIX)
+    add_executable(programmable-private-payload-fixture tests/private_payload_fixture.cpp)
+    target_include_directories(programmable-private-payload-fixture PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+    add_executable(programmable-private-payload-tests tests/private_payload_tests.cpp)
+    target_include_directories(programmable-private-payload-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+    target_compile_definitions(programmable-private-payload-tests PRIVATE
+        PRIVATE_PAYLOAD_FIXTURE="$<TARGET_FILE:programmable-private-payload-fixture>")
+    add_dependencies(programmable-private-payload-tests programmable-private-payload-fixture)
+    add_test(NAME programmable_private_payload COMMAND programmable-private-payload-tests)
+    set_tests_properties(programmable_private_payload PROPERTIES TIMEOUT 30)
+    # This matrix asserts compile-gated private diagnostics in addition to the
+    # public grant/replay behavior.  Do not register it against production-mode
+    # helpers, where those diagnostics intentionally do not exist.
+    if(ARBIT_PROGRAMMABLE_TEST_MODE)
+        add_test(NAME programmable_rpc_grant_matrix
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/programmable_rpc_grant_matrix.py
+                    $<TARGET_FILE:arbit-video-helper>)
+        set_tests_properties(programmable_rpc_grant_matrix PROPERTIES TIMEOUT 30 RUN_SERIAL TRUE)
+    endif()
+
+endif()
+
+# Production lifecycle coverage deliberately links JUCE and drives the real
+# process manager into the exact helper target rather than a fork-only fixture.
+# It is also a Windows source/launch gate: that build exercises the production
+# CreateProcess call site and proves required-private-channel launch is refused.
+set(ARBIT_JUCE_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../JUCE" CACHE PATH
+    "JUCE source tree used by the production sidecar lifecycle test")
+if(EXISTS "${ARBIT_JUCE_SOURCE_DIR}/CMakeLists.txt" AND NOT MINGW)
+    add_subdirectory("${ARBIT_JUCE_SOURCE_DIR}" ${CMAKE_CURRENT_BINARY_DIR}/JUCE EXCLUDE_FROM_ALL)
+    add_executable(programmable-production-lifecycle-tests
+        tests/production_lifecycle_tests.cpp)
+    target_include_directories(programmable-production-lifecycle-tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../plugin/Source)
+    target_compile_definitions(programmable-production-lifecycle-tests PRIVATE
+        PRIVATE_LIFECYCLE_HELPER="$<TARGET_FILE:arbit-video-helper>"
+        ARBIT_PROGRAMMABLE_TEST_MODE=1 JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(programmable-resource-limit-fixture
+            tests/resource_limit_fixture.cpp)
+        target_compile_definitions(programmable-production-lifecycle-tests PRIVATE
+            RESOURCE_LIMIT_FIXTURE="$<TARGET_FILE:programmable-resource-limit-fixture>")
+        add_dependencies(programmable-production-lifecycle-tests
+            programmable-resource-limit-fixture)
+    endif()
+    target_link_libraries(programmable-production-lifecycle-tests PRIVATE
+        juce::juce_core juce::juce_events)
+    if(NOT MSVC)
+        target_compile_options(programmable-production-lifecycle-tests PRIVATE -UNDEBUG)
+    endif()
+    add_dependencies(programmable-production-lifecycle-tests arbit-video-helper)
+    if(ARBIT_PROGRAMMABLE_TEST_MODE)
+        add_test(NAME programmable_production_lifecycle
+            COMMAND programmable-production-lifecycle-tests)
+        set_tests_properties(programmable_production_lifecycle PROPERTIES TIMEOUT 30 RUN_SERIAL TRUE)
+    endif()
+endif()
+
+add_executable(programmable-platform-capability-tests tests/platform_capability_tests.cpp)
+target_include_directories(programmable-platform-capability-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+add_test(NAME programmable_platform_capability COMMAND programmable-platform-capability-tests)
+set_tests_properties(programmable_platform_capability PROPERTIES TIMEOUT 30)
+
+add_executable(programmable-hook-limits-tests tests/programmable_hook_limits_tests.cpp)
+target_include_directories(programmable-hook-limits-tests PRIVATE src)
+if(LUA_FOUND)
+    target_link_libraries(programmable-hook-limits-tests PRIVATE PkgConfig::LUA)
+    target_compile_definitions(programmable-hook-limits-tests PRIVATE ARBIT_HAVE_LUA=1)
+endif()
+if(TARGET arbit-quickjs)
+    target_link_libraries(programmable-hook-limits-tests PRIVATE arbit-quickjs)
+    target_compile_definitions(programmable-hook-limits-tests PRIVATE ARBIT_HAVE_QUICKJS=1)
+endif()
+if(NOT MSVC)
+    target_compile_options(programmable-hook-limits-tests PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME programmable_hook_limits COMMAND programmable-hook-limits-tests)
+set_tests_properties(programmable_hook_limits PROPERTIES TIMEOUT 30)
+
+if(UNIX AND NOT WIN32)
+    add_executable(arbit-depth-cache-tests tests/depth_cache_tests.cpp)
+    target_include_directories(arbit-depth-cache-tests PRIVATE src)
+    target_link_libraries(arbit-depth-cache-tests PRIVATE PkgConfig::AV nlohmann_json::nlohmann_json)
+    target_compile_options(arbit-depth-cache-tests PRIVATE -Wall -Wextra -Werror)
+    add_test(NAME depth_cache_admission COMMAND arbit-depth-cache-tests)
+    set_tests_properties(depth_cache_admission PROPERTIES TIMEOUT 30)
+endif()
+add_test(NAME depth_cache_windows_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/depth_cache_windows_source_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(arbit-composite-probe-contract-tests tests/composite_probe_contract_tests.cpp)
+target_include_directories(arbit-composite-probe-contract-tests PRIVATE src)
+if(NOT MSVC)
+    target_compile_options(arbit-composite-probe-contract-tests PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME composite_probe_contract COMMAND arbit-composite-probe-contract-tests)
+
+add_executable(arbit-visual-plan-executor-tests tests/visual_plan_executor_tests.cpp)
+target_include_directories(arbit-visual-plan-executor-tests PRIVATE src)
+target_link_libraries(arbit-visual-plan-executor-tests PRIVATE nlohmann_json::nlohmann_json)
+if(NOT MSVC)
+    target_compile_options(arbit-visual-plan-executor-tests PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME visual_plan_executor COMMAND arbit-visual-plan-executor-tests)
+
+if(UNIX AND NOT WIN32)
+    add_executable(arbit-tracking-runtime-tests tests/tracking_runtime_tests.cpp)
+    target_include_directories(arbit-tracking-runtime-tests PRIVATE src)
+    target_compile_definitions(arbit-tracking-runtime-tests PRIVATE
+        ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=0)
+    target_link_libraries(arbit-tracking-runtime-tests PRIVATE nlohmann_json::nlohmann_json)
+    target_compile_options(arbit-tracking-runtime-tests PRIVATE -Wall -Wextra -Werror)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 16)
+        # GCC 16 misdiagnoses nlohmann::json's shared output adapter teardown
+        # after inlining it through dump(); keep project warnings fatal.
+        target_compile_options(arbit-tracking-runtime-tests PRIVATE -Wno-array-bounds)
+    endif()
+    add_test(NAME tracking_runtime COMMAND arbit-tracking-runtime-tests)
+    set_tests_properties(tracking_runtime PROPERTIES TIMEOUT 30)
+endif()
+
+add_test(NAME generator_particle_telemetry_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/generator_particle_telemetry_source_contract.py)
+add_test(NAME node_cost_telemetry_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/node_cost_telemetry_source_contract.py)
+
+add_executable(arbit-viewport-telemetry-owner-tests tests/viewport_telemetry_owner_tests.cpp)
+target_include_directories(arbit-viewport-telemetry-owner-tests PRIVATE src)
+if(NOT MSVC)
+    target_compile_options(arbit-viewport-telemetry-owner-tests PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME viewport_telemetry_owner COMMAND arbit-viewport-telemetry-owner-tests)
+add_test(NAME viewport_telemetry_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/viewport_telemetry_source_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(arbit-export-telemetry-owner-tests tests/export_telemetry_owner_tests.cpp)
+target_include_directories(arbit-export-telemetry-owner-tests PRIVATE src)
+if(NOT MSVC)
+    target_compile_options(arbit-export-telemetry-owner-tests PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME export_telemetry_owner COMMAND arbit-export-telemetry-owner-tests)
+add_test(NAME export_telemetry_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/export_telemetry_source_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+
+# M7 physical Linux acceptance: drive the production helper/exporter/FrameRenderer
+# and FFmpeg handoff at exact 1080p then 4K. This is intentionally not part of
+# the default test set: it needs a real OpenGL device/display and ffprobe and may
+# take up to five minutes. Run explicitly with `ctest -L native-export-runtime`.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND GLFW3_FOUND AND OpenGL_FOUND)
+    add_test(NAME native_linux_export_runtime
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/export_runtime_fixture.py
+                $<TARGET_FILE:arbit-video-helper>)
+    set_tests_properties(native_linux_export_runtime PROPERTIES
+        LABELS "native-export-runtime"
+        TIMEOUT 300
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE)
+endif()
+
+add_executable(arbit-viewport-plan-concurrency-tests tests/viewport_plan_concurrency_tests.cpp)
+target_include_directories(arbit-viewport-plan-concurrency-tests PRIVATE src)
+find_package(Threads REQUIRED)
+target_link_libraries(arbit-viewport-plan-concurrency-tests PRIVATE Threads::Threads)
+if(NOT MSVC)
+    target_compile_options(arbit-viewport-plan-concurrency-tests PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME viewport_plan_concurrency COMMAND arbit-viewport-plan-concurrency-tests)
+
+if(GLFW3_FOUND AND OpenGL_FOUND)
+    # Real Linux pixel acceptance for Depth Fog. This compiles the production
+    # FrameRenderer and shader owners, creates a hidden native GL context, uploads
+    # an actual GL_R16 gradient, and reads the composited pixels back. No CPU
+    # renderer or replacement shader participates.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(arbit-depth-fog-gl-pixel-tests
+            tests/depth_fog_gl_pixel_tests.cpp
+            src/renderer.cpp
+            src/shader_generator.cpp
+            src/particle_engine.cpp
+            src/gl_loader.cpp
+            src/lut_loader.cpp)
+        target_include_directories(arbit-depth-fog-gl-pixel-tests PRIVATE src)
+        target_compile_definitions(arbit-depth-fog-gl-pixel-tests PRIVATE
+            ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=0)
+        target_link_libraries(arbit-depth-fog-gl-pixel-tests PRIVATE
+            PkgConfig::GLFW3 OpenGL::GL nlohmann_json::nlohmann_json PkgConfig::AV)
+        target_compile_options(arbit-depth-fog-gl-pixel-tests PRIVATE -Wall -Wextra -Werror)
+        add_test(NAME depth_fog_gl_pixels COMMAND arbit-depth-fog-gl-pixel-tests)
+        set_tests_properties(depth_fog_gl_pixels PROPERTIES
+            LABELS "native-depth-fog-runtime"
+            TIMEOUT 600
+            SKIP_RETURN_CODE 77
+            RUN_SERIAL TRUE)
+    endif()
+
+    # The production particle GL path requires OpenGL 4.3 shader-storage
+    # buffers. macOS exposes at most OpenGL 4.1 and uses the native Metal path.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(arbit-particle-engine-gl-tests
+            tests/particle_engine_gl_tests.cpp src/particle_engine.cpp src/gl_loader.cpp)
+        target_include_directories(arbit-particle-engine-gl-tests PRIVATE src)
+        target_compile_definitions(arbit-particle-engine-gl-tests PRIVATE
+            ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=0)
+        target_link_libraries(arbit-particle-engine-gl-tests PRIVATE PkgConfig::GLFW3 OpenGL::GL)
+        add_test(NAME particle_engine_gl COMMAND arbit-particle-engine-gl-tests)
+        set_tests_properties(particle_engine_gl PROPERTIES
+            LABELS "native-particle-runtime"
+            TIMEOUT 600
+            SKIP_RETURN_CODE 77
+            RUN_SERIAL TRUE)
+    endif()
+endif()
+
+add_executable(arbit-node-preview-presentation-tests tests/node_preview_presentation_tests.cpp)
+target_include_directories(arbit-node-preview-presentation-tests PRIVATE src)
+if(NOT MSVC)
+    target_compile_options(arbit-node-preview-presentation-tests PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME node_preview_presentation COMMAND arbit-node-preview-presentation-tests)
+
+if(APPLE AND ARBIT_WITH_METAL)
+    add_executable(arbit-metal-backend-tests
+        tests/metal_backend_tests.cpp
+        src/gpu_backend/backend_sokol.mm)
+    target_include_directories(arbit-metal-backend-tests PRIVATE src third_party/sokol)
+    target_link_libraries(arbit-metal-backend-tests PRIVATE
+        "-framework Metal" "-framework QuartzCore" "-framework Cocoa")
+    add_test(NAME metal_backend COMMAND arbit-metal-backend-tests)
+
+    if(GLFW3_FOUND AND OpenGL_FOUND)
+        add_executable(arbit-metal-iosurface-consumer
+            tests/metal_iosurface_consumer.mm)
+        target_link_libraries(arbit-metal-iosurface-consumer PRIVATE
+            "-framework Metal" "-framework IOSurface" "-framework Foundation")
+
+        add_executable(arbit-metal-particle-smoke
+            tests/metal_particle_smoke_tests.cpp
+            src/particle_engine.cpp
+            src/gl_loader.cpp
+            src/gpu_backend/backend_sokol.mm)
+        target_include_directories(arbit-metal-particle-smoke PRIVATE src third_party/sokol)
+        target_compile_definitions(arbit-metal-particle-smoke PRIVATE
+            ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=1)
+        target_link_libraries(arbit-metal-particle-smoke PRIVATE
+            PkgConfig::GLFW3 OpenGL::GL
+            "-framework Metal" "-framework QuartzCore" "-framework Cocoa"
+            "-framework IOSurface")
+
+        add_executable(arbit-metal-frame-compositor-smoke
+            tests/metal_frame_compositor_smoke_tests.cpp
+            src/gl_loader.cpp
+            src/gpu_backend/metal_shader_generator.mm
+            src/gpu_backend/backend_sokol.mm)
+        target_include_directories(arbit-metal-frame-compositor-smoke PRIVATE
+            src third_party/sokol
+            ${ARBIT_MVK_SHADER_CONVERTER_INCLUDE}
+            ${ncnn_SOURCE_DIR}/glslang)
+        target_compile_definitions(arbit-metal-frame-compositor-smoke PRIVATE
+            ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=1
+            ARBIT_HAVE_METAL_GENERATORS=1)
+        target_link_libraries(arbit-metal-frame-compositor-smoke PRIVATE
+            PkgConfig::GLFW3 OpenGL::GL
+            "-framework Metal" "-framework QuartzCore" "-framework Cocoa"
+            "-framework IOSurface" "-framework Foundation"
+            nlohmann_json::nlohmann_json
+            glslang SPIRV glslang-default-resource-limits
+            ${ARBIT_MVK_SHADER_CONVERTER_LIBRARY}
+            ${ARBIT_MVK_SPIRV_CROSS_LIBRARY}
+            ${ARBIT_MVK_SPIRV_TOOLS_LIBRARY})
+        add_dependencies(arbit-metal-frame-compositor-smoke
+            arbit-metal-iosurface-consumer)
+        add_test(NAME metal_frame_compositor_smoke
+                 COMMAND arbit-metal-frame-compositor-smoke)
+    endif()
+endif()
+
 if(Python3_Interpreter_FOUND AND UNIX)
     add_test(NAME concurrent_recorder_smoke
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrent_recorder_smoke.py
@@ -488,5 +945,7 @@ if(Python3_Interpreter_FOUND AND UNIX)
     add_test(NAME capture_source_smoke
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/capture_source_smoke.py
                 $<TARGET_FILE:arbit-video-helper>)
-    set_tests_properties(concurrent_recorder_smoke capture_source_smoke PROPERTIES TIMEOUT 30)
+    set_tests_properties(concurrent_recorder_smoke capture_source_smoke PROPERTIES
+        TIMEOUT 30
+        RUN_SERIAL TRUE)
 endif()

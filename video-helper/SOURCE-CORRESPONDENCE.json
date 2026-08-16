@@ -1,6 +1,5 @@
 {
-  "schemaVersion": 1,
-  "donutStudioVersion": "0.6.0",
-  "privateSourceCommit": "69911339c41a284dd87d5290b81dd61579133483",
-  "helperTreeSha256": "0e553bd0a30578beeac8357084b1abf96ab9006d6ee525a9099472b54605fabb"
+  "donutStudioVersion": "0.7.0",
+  "privateSourceCommit": "6c2b854233f806b7a2fd771274d6bd4581b745a6",
+  "helperTreeSha256": "e7b8bb271c630997467eeaef48f1d118b870f6e45d43298ba8cee64b935b30a4"
 }

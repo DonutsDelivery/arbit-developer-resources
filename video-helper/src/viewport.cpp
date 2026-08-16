@@ -7,6 +7,11 @@
 #include "mix_analyze.h"      // baked-mix offline analysis (audio parity when stopped)
 #include "lua_hook.h"         // P2 Scripts-tab live preview (M8 per-frame Lua hook)
 #include "js_hook.h"          // P2 Scripts-tab live preview (JS hook; shares FrameCtx)
+#include "visual_plan_executor.h"
+#include "depth_texture_runtime.h"
+#include "tracking_runtime.h"
+#include "visual_plan_publication.h"
+#include "viewport_telemetry_owner.h"
 #include "VideoFrameSharedMemory.h"
 #if ARBIT_HAVE_ONNX || ARBIT_HAVE_NCNN
 #include "interp.h" // retime tier 2 (async RIFE "Speed Warp") worker
@@ -21,6 +26,10 @@
 #include <nlohmann/json.hpp>
 
 #include <GLFW/glfw3.h>
+#if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
+#include <IOSurface/IOSurface.h>
+#include "mac_metal_viewport_surface.h"
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -28,6 +37,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <set>
 
 #if ARBIT_HAVE_GPU_SHARED
@@ -49,6 +59,75 @@ int64_t nowNs()
 {
     return std::chrono::duration_cast<std::chrono::nanoseconds> (
                std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void applyAlphaMatte (DecodedFrame& frame, MediaContext& matte, double sourceSec)
+{
+    DecodedFrame matteFrame;
+    if (! matte.getFrame (sourceSec, frame.width, frame.height, matteFrame).empty()
+        || matteFrame.width != frame.width || matteFrame.height != frame.height
+        || matteFrame.rgba.empty())
+        return;
+
+    for (int y = 0; y < frame.height; ++y)
+    {
+        auto* frameRow = frame.rgba.data() + static_cast<size_t> (y) * frame.strideBytes;
+        const auto* matteRow = matteFrame.rgba.data()
+                             + static_cast<size_t> (y) * matteFrame.strideBytes;
+        for (int x = 0; x < frame.width; ++x)
+            frameRow[x * 4 + 3] = static_cast<uint8_t> (
+                (frameRow[x * 4 + 3] * matteRow[x * 4]) / 255);
+    }
+}
+
+bool shouldUseStrictMetalBackend (bool shared)
+{
+#if defined (__APPLE__) && ARBIT_HAVE_IOSURFACE
+#if defined (__arm64__) || defined (__aarch64__)
+    (void) shared;
+    return true;
+#else
+    return shared || MacMetalViewportSurface::available();
+#endif
+#else
+    (void) shared;
+    return false;
+#endif
+}
+
+void configureGlfwWindowHints (bool offscreen, bool shared, bool alwaysOnTop,
+                               bool metalOnly = false)
+{
+    // OpenGL 4.3 core (4.1 on macOS, which caps desktop GL there).
+#if defined (__APPLE__)
+    if (metalOnly)
+        glfwWindowHint (GLFW_CLIENT_API, GLFW_NO_API);
+    else
+    {
+        glfwWindowHint (GLFW_CONTEXT_VERSION_MAJOR, 4);
+        glfwWindowHint (GLFW_CONTEXT_VERSION_MINOR, 1);
+        glfwWindowHint (GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+        glfwWindowHint (GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
+    }
+#else
+    (void) metalOnly;
+    glfwWindowHint (GLFW_CONTEXT_VERSION_MAJOR, 4);
+    glfwWindowHint (GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint (GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint (GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
+#endif
+    glfwWindowHint (GLFW_FLOATING, alwaysOnTop ? GLFW_TRUE : GLFW_FALSE);
+    glfwWindowHint (GLFW_RESIZABLE, GLFW_TRUE);
+    if (offscreen)
+    {
+        glfwWindowHint (GLFW_VISIBLE, GLFW_FALSE);
+#if ARBIT_HAVE_DMABUF && ! ARBIT_HAVE_VKFD
+        if (shared)
+            glfwWindowHint (GLFW_CONTEXT_CREATION_API, GLFW_EGL_CONTEXT_API);
+#else
+        (void) shared;
+#endif
+    }
 }
 
 // Pending timestamped parameter change (graph_set_param with atBeat >= 0).
@@ -106,10 +185,38 @@ std::string base64Encode (const uint8_t* data, size_t n)
 
 struct Viewport::Impl
 {
+    Impl() { visualPlanPublication->state.setTelemetryOwner (visualTelemetry); }
     mutable std::mutex mutex;
+    std::string depthCacheRoot;
+
+#if defined (__APPLE__)
+    // Cocoa requires GLFW initialization and window creation/destruction on
+    // the process main thread. The RPC thread is main, so macOS offscreen
+    // modes create their hidden context there, detach it, then let the render
+    // thread own the GL context for the lifetime of the viewport.
+    GLFWwindow* macPrecreatedWindow = nullptr;
+#endif
 
     // Control-plane state (written by RPC thread, read by render thread).
     std::vector<ViewportSegment> segments;
+    std::vector<videowire::VisualEventScheduleBinding> visualEventSchedules;
+    videowire::VisualPlanTelemetry visualTelemetry;
+    std::shared_ptr<videowire::VisualPlanExecutionSnapshot> visualPlanPublication =
+        std::make_shared<videowire::VisualPlanExecutionSnapshot>();
+    uint64_t failedPlanLowerings = 0;
+    std::string lastPlanLoweringError;
+    int inspectionClipId = -1;
+    uint64_t inspectionStructuralRevision = 0;
+    int inspectionNodeId = 0;
+    int inspectionOutputPort = -1;
+    bool inspectionResourceReady = false;
+    unsigned inspectionResourceHandle = 0;
+    uint64_t inspectionResourceGeneration = 0;
+    int inspectionResourceWidth = 0;
+    int inspectionResourceHeight = 0;
+    std::string inspectionResourceBackend;
+    bool inspectionMetalAdmitted = false;
+    videopreview::State inspectionPresentation;
     std::map<int, ClipGraphParams> clipParams; // keyed by clipId
     std::vector<PendingParam> pendingParams;
     videoshm::TransportRegion transport;
@@ -120,6 +227,8 @@ struct Viewport::Impl
     videoshm::AudioRingRegion audioRing;
     std::string audioName;
     uint64_t timelineGeneration = 0; // bumped by setTimeline (stream pruning)
+    videotime::BeatTimeline beatTimeline;
+    uint64_t beatTimelineGeneration = 0;
 
     // Frame-perfect audio parity (sweep): the offline-analyzed master mix
     // (setAudioMix). The live ring only flows WHILE PLAYING, so while STOPPED the
@@ -149,6 +258,18 @@ struct Viewport::Impl
     // to never calling setModMatrix).
     std::vector<arbitmod::Routing> routings;
     uint64_t modGeneration = 0;
+    videocontrol::Plan controlPlan;
+    uint64_t controlPlanGeneration = 0;
+    struct VisualEvent
+    {
+        std::string kind;
+        int clipId = -1;
+        uint64_t sequence = 0;
+        uint64_t epoch = 0;
+    };
+    std::vector<VisualEvent> visualEvents;
+    std::map<std::pair<std::string, int>, uint64_t> visualEventLastSequences;
+    uint64_t visualEventEpoch = 0;
 
     // P2 Scripts-tab live preview (setScript). The project-global per-frame hook
     // source + engine ("js" | "lua"). scriptGeneration is bumped on every push so
@@ -157,6 +278,8 @@ struct Viewport::Impl
     // calling setScript).
     std::string scriptSource;
     std::string scriptLang;
+    uint32_t scriptCpuMs = 0;
+    uint32_t scriptMemoryMiB = 0;
     uint64_t scriptGeneration = 0;
 
     // Text overlay store (text_set_image / text_remove) — independent of the
@@ -325,6 +448,12 @@ struct Viewport::Impl
     uint32_t transportGeneration = 0;
     double transportAgeSec = 0.0;
     double transportPlayheadBeats = 0.0;
+    std::string particleBackend = "none";
+    std::string compositorBackend = "opengl";
+    std::string gpuPath = "opengl";
+    std::string backendPolicy = "legacy-opengl";
+    std::string rendererError;
+    uint64_t fallbackCount = 0;
     int curW = 0, curH = 0;
     arbitgl::GpuCaps gpuCaps;          // snapshot once after context creation (P1)
     std::atomic<bool> windowOpen { false };
@@ -454,6 +583,15 @@ struct Viewport::Impl
 
 Viewport::Viewport() = default;
 Viewport::~Viewport() { close(); }
+void Viewport::setDepthCacheRoot(std::string root)
+{
+    depthCacheRoot_ = std::move(root);
+    if (impl_ != nullptr)
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->depthCacheRoot = depthCacheRoot_;
+    }
+}
 
 const char* Viewport::sharedGpuPathTag()
 {
@@ -477,8 +615,37 @@ std::string Viewport::open (int width, int height, int x, int y,
     }
 
     impl_ = std::make_unique<Impl>();
+    impl_->depthCacheRoot = depthCacheRoot_;
     impl_->valueFps = clkFps;   // project value-grid fps (frame-perfect parity)
     impl_->openDone = false;
+    impl_->reqX = x >= 0 ? x : 100;
+    impl_->reqY = y >= 0 ? y : 100;
+    impl_->reqW = width;
+    impl_->reqH = height;
+#if defined (__APPLE__)
+    // Cocoa requires NSWindow creation and destruction on the process main
+    // thread. The render worker may own Metal encoding, but it must reuse the
+    // GLFW window created here while the RPC handler is still on main.
+    if (glfwInit() != GLFW_TRUE)
+    {
+        impl_.reset();
+        return "glfwInit failed on macOS main thread";
+    }
+    const bool metalOnly = shouldUseStrictMetalBackend (false);
+    configureGlfwWindowHints (false, false, alwaysOnTop, metalOnly);
+    impl_->macPrecreatedWindow = glfwCreateWindow (width, height, "Arbit Video", nullptr, nullptr);
+    if (impl_->macPrecreatedWindow == nullptr)
+    {
+        glfwTerminate();
+        impl_.reset();
+        return metalOnly
+            ? "glfwCreateWindow failed for the macOS Metal viewport"
+            : "glfwCreateWindow failed for the macOS OpenGL viewport";
+    }
+    if (x >= 0 && y >= 0)
+        glfwSetWindowPos (impl_->macPrecreatedWindow, x, y);
+    glfwMakeContextCurrent (nullptr);
+#endif
     running_ = true;
     thread_ = std::thread ([this, width, height, x, y, alwaysOnTop, targetFps]
                            { renderLoop (width, height, x, y, alwaysOnTop, targetFps); });
@@ -507,10 +674,27 @@ std::string Viewport::openShared (int width, int height, double targetFps,
                    : "viewport window already open — close it first";
 
     impl_ = std::make_unique<Impl>();
+    impl_->depthCacheRoot = depthCacheRoot_;
     impl_->valueFps = clkFps;   // project value-grid fps (frame-perfect parity)
     impl_->openDone = false;
     impl_->sharedMode = true;
     impl_->sharedBufferCount = std::clamp (bufferCount, 2, 4);
+#if defined (__APPLE__)
+    if (glfwInit() != GLFW_TRUE)
+    {
+        impl_.reset();
+        return "glfwInit failed on macOS main thread";
+    }
+    configureGlfwWindowHints (true, true, false, true);
+    impl_->macPrecreatedWindow = glfwCreateWindow (width, height, "Arbit Video", nullptr, nullptr);
+    if (impl_->macPrecreatedWindow == nullptr)
+    {
+        glfwTerminate();
+        impl_.reset();
+        return "glfwCreateWindow failed (macOS OpenGL 4.1 offscreen context unavailable?)";
+    }
+    glfwMakeContextCurrent (nullptr);
+#endif
     running_ = true;
     thread_ = std::thread ([this, width, height, targetFps]
                            { renderLoop (width, height, -1, -1, false, targetFps); });
@@ -562,6 +746,7 @@ std::string Viewport::openShm (int width, int height, double targetFps,
         return "bad shm viewport size";
 
     impl_ = std::make_unique<Impl>();
+    impl_->depthCacheRoot = depthCacheRoot_;
     impl_->valueFps = clkFps;   // project value-grid fps (frame-perfect parity)
     impl_->openDone = false;
     impl_->shmMode = true;
@@ -576,6 +761,26 @@ std::string Viewport::openShm (int width, int height, double targetFps,
         impl_.reset();
         return "bad frame shm region: " + shmName;
     }
+
+#if defined (__APPLE__)
+    if (glfwInit() != GLFW_TRUE)
+    {
+        impl_.reset();
+        return "glfwInit failed on macOS main thread";
+    }
+    const bool metalOnly = shouldUseStrictMetalBackend (false);
+    configureGlfwWindowHints (true, false, false, metalOnly);
+    impl_->macPrecreatedWindow = glfwCreateWindow (width, height, "Arbit Video", nullptr, nullptr);
+    if (impl_->macPrecreatedWindow == nullptr)
+    {
+        glfwTerminate();
+        impl_.reset();
+        return metalOnly
+            ? "glfwCreateWindow failed for the macOS Metal offscreen viewport"
+            : "glfwCreateWindow failed (macOS OpenGL 4.1 offscreen context unavailable?)";
+    }
+    glfwMakeContextCurrent (nullptr);
+#endif
 
     running_ = true;
     thread_ = std::thread ([this, width, height, targetFps]
@@ -612,7 +817,54 @@ void Viewport::close()
     running_ = false;
     if (thread_.joinable())
         thread_.join();
+#if defined (__APPLE__)
+    if (impl_ != nullptr && impl_->macPrecreatedWindow != nullptr)
+    {
+        // The render thread detached this context before returning. Cocoa
+        // requires destruction and glfwTerminate on this main RPC thread.
+        glfwDestroyWindow (impl_->macPrecreatedWindow);
+        impl_->macPrecreatedWindow = nullptr;
+        glfwTerminate();
+    }
+#endif
     impl_.reset();
+}
+
+void Viewport::processWindowEvents()
+{
+#if defined (__APPLE__)
+    if (! running_.load() || impl_ == nullptr || impl_->sharedMode || impl_->shmMode
+        || impl_->macPrecreatedWindow == nullptr)
+        return;
+
+    auto* win = impl_->macPrecreatedWindow;
+    glfwPollEvents();
+    if (glfwWindowShouldClose (win))
+    {
+        impl_->wantClose = true;
+        running_ = false;
+        return;
+    }
+    if (impl_->boundsDirty.exchange (false))
+    {
+        std::lock_guard<std::mutex> lock (impl_->mutex);
+        glfwSetWindowPos (win, impl_->reqX, impl_->reqY);
+        glfwSetWindowSize (win, impl_->reqW, impl_->reqH);
+    }
+    const int fsReq = impl_->fullscreenRequest.exchange (-1);
+    if (fsReq == 1)
+    {
+        auto* mon = glfwGetPrimaryMonitor();
+        const auto* mode = glfwGetVideoMode (mon);
+        glfwSetWindowMonitor (win, mon, 0, 0, mode->width, mode->height, mode->refreshRate);
+    }
+    else if (fsReq == 0)
+    {
+        std::lock_guard<std::mutex> lock (impl_->mutex);
+        glfwSetWindowMonitor (win, nullptr, impl_->reqX, impl_->reqY,
+                              impl_->reqW, impl_->reqH, 0);
+    }
+#endif
 }
 
 void Viewport::setBounds (int x, int y, int width, int height)
@@ -629,15 +881,178 @@ void Viewport::setFullscreen (bool fullscreen)
     impl_->fullscreenRequest = fullscreen ? 1 : 0;
 }
 
-void Viewport::setTimeline (std::vector<ViewportSegment> segments)
+std::string Viewport::setTimeline (std::vector<ViewportSegment> segments,
+                                   std::vector<videowire::CompiledVisualLayerPlan> plans,
+                                   std::vector<videowire::VisualEventScheduleBinding> eventSchedules)
 {
-    if (impl_ == nullptr) return;
+    if (impl_ == nullptr) return "viewport is not open";
     std::sort (segments.begin(), segments.end(),
                [] (const ViewportSegment& a, const ViewportSegment& b)
                { return a.displayStartSec < b.displayStartSec; });
+
+    std::shared_ptr<videowire::VisualPlanExecutionSnapshot> publication;
+    std::string diagnostic;
+    if (! videowire::makeVisualPlanExecutionSnapshot(std::move(plans), publication, diagnostic,
+                                                     &impl_->visualTelemetry))
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        ++impl_->failedPlanLowerings;
+        impl_->lastPlanLoweringError = diagnostic;
+        return diagnostic;
+    }
+
     std::lock_guard<std::mutex> lock (impl_->mutex);
     impl_->segments = std::move (segments);
+    impl_->visualEventSchedules = std::move (eventSchedules);
+    impl_->visualPlanPublication = std::move(publication);
+    impl_->lastPlanLoweringError.clear();
     ++impl_->timelineGeneration;
+    return {};
+}
+
+std::string Viewport::setInspectionTarget (int clipId, uint64_t structuralRevision,
+                                           int nodeId, int outputPort)
+{
+    if (impl_ == nullptr) return "viewport is not open";
+    std::lock_guard<std::mutex> lock (impl_->mutex);
+    std::string error;
+    if (! videowire::validateVisualInspectionTarget(impl_->visualPlanPublication->plans,
+            { clipId, structuralRevision, nodeId, outputPort }, error))
+        return error;
+    impl_->inspectionClipId = clipId;
+    impl_->inspectionStructuralRevision = structuralRevision;
+    impl_->inspectionNodeId = nodeId;
+    impl_->inspectionOutputPort = outputPort;
+    impl_->inspectionResourceReady = false;
+    impl_->inspectionResourceHandle = 0;
+    return {};
+}
+
+std::string Viewport::describeInspection() const
+{
+    if (impl_ == nullptr) return R"({"ready":false})";
+    std::lock_guard<std::mutex> lock (impl_->mutex);
+    nlohmann::json value {
+        { "clipId", impl_->inspectionClipId },
+        { "structuralRevision", impl_->inspectionStructuralRevision },
+        { "nodeId", impl_->inspectionNodeId },
+        { "outputPort", impl_->inspectionOutputPort },
+        { "ready", impl_->inspectionResourceReady },
+        { "resourceHandle", impl_->inspectionResourceHandle },
+        { "generation", impl_->inspectionResourceGeneration },
+        { "width", impl_->inspectionResourceWidth },
+        { "height", impl_->inspectionResourceHeight },
+        { "backend", impl_->inspectionResourceBackend },
+        { "presentationBackend", videopreview::backendAvailability(
+              shouldUseStrictMetalBackend(false), impl_->inspectionMetalAdmitted) },
+        { "layout", static_cast<int>(impl_->inspectionPresentation.layout) },
+        { "background", static_cast<int>(impl_->inspectionPresentation.background) },
+        { "zoom", impl_->inspectionPresentation.zoom },
+        { "panX", impl_->inspectionPresentation.panX },
+        { "panY", impl_->inspectionPresentation.panY },
+        { "split", impl_->inspectionPresentation.split }
+    };
+    return value.dump();
+}
+
+std::string Viewport::setInspectionPresentation (videopreview::State state)
+{
+    if (impl_ == nullptr) return "viewport is not open";
+    std::string error;
+    if (! videopreview::normalize(state, error)) return error;
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (! videopreview::presentationAdmitted(shouldUseStrictMetalBackend(false),
+            impl_->inspectionMetalAdmitted, state, error))
+        return error;
+    impl_->inspectionPresentation = state;
+    return {};
+}
+
+bool Viewport::installSnapshot (videowire::ResolvedVisualSnapshot snapshot)
+{
+    if (snapshot.authoringRevision == 0)
+    {
+        std::lock_guard<std::mutex> revisionLock (revisionMutex_);
+        snapshot.authoringRevision = revisionLedger_.state().authoring + 1;
+        if (! revisionLedger_.requestAuthoring (snapshot.authoringRevision))
+            return false;
+        if (! setTimeline(std::move(snapshot.segments), std::move(snapshot.visualLayerPlans),
+                          std::move(snapshot.visualEventSchedules)).empty())
+        {
+            revisionLedger_.compileSucceeded(snapshot.authoringRevision, false);
+            return false;
+        }
+        revisionLedger_.accept (snapshot.authoringRevision);
+        revisionLedger_.compileSucceeded (snapshot.authoringRevision, true);
+        acceptStructuralRevision (snapshot.authoringRevision);
+        return true;
+    }
+    if (! beginSnapshot (snapshot.authoringRevision))
+        return false;
+    return completeSnapshot (std::move (snapshot));
+}
+
+bool Viewport::beginSnapshot (uint64_t authoringRevision)
+{
+    std::lock_guard<std::mutex> revisionLock (revisionMutex_);
+    if (authoringRevision == 0)
+        authoringRevision = revisionLedger_.state().authoring + 1;
+    return revisionLedger_.requestAuthoring (authoringRevision);
+}
+
+bool Viewport::completeSnapshot (videowire::ResolvedVisualSnapshot snapshot)
+{
+    std::lock_guard<std::mutex> revisionLock (revisionMutex_);
+    if (snapshot.authoringRevision != revisionLedger_.state().authoring)
+        return false;
+    if (! setTimeline(std::move(snapshot.segments), std::move(snapshot.visualLayerPlans),
+                      std::move(snapshot.visualEventSchedules)).empty())
+    {
+        revisionLedger_.compileSucceeded(snapshot.authoringRevision, false);
+        return false;
+    }
+    revisionLedger_.accept (snapshot.authoringRevision);
+    revisionLedger_.compileSucceeded (snapshot.authoringRevision, true);
+    acceptStructuralRevision (snapshot.authoringRevision);
+    return true;
+}
+
+bool Viewport::rejectSnapshot (uint64_t authoringRevision)
+{
+    std::lock_guard<std::mutex> lock (revisionMutex_);
+    if (authoringRevision == 0)
+        authoringRevision = revisionLedger_.state().authoring + 1;
+    if (! revisionLedger_.requestAuthoring (authoringRevision))
+        return false;
+    return revisionLedger_.reject (authoringRevision);
+}
+
+videowire::RevisionTuple Viewport::revisionState() const
+{
+    std::lock_guard<std::mutex> lock (revisionMutex_);
+    return revisionLedger_.state();
+}
+
+bool Viewport::advanceEvaluation (uint64_t sequence)
+{
+    std::lock_guard<std::mutex> lock (revisionMutex_);
+    return revisionLedger_.evaluate (revisionLedger_.state().compiled, sequence);
+}
+
+void Viewport::acceptStructuralRevision (uint64_t revision) noexcept
+{
+    auto seen = structuralRevision_.load (std::memory_order_relaxed);
+    while (seen < revision
+           && ! structuralRevision_.compare_exchange_weak (
+               seen, revision, std::memory_order_release, std::memory_order_relaxed)) {}
+}
+
+void Viewport::acceptRuntimeRevision (uint64_t revision) noexcept
+{
+    auto seen = runtimeRevision_.load (std::memory_order_relaxed);
+    while (seen < revision
+           && ! runtimeRevision_.compare_exchange_weak (
+               seen, revision, std::memory_order_release, std::memory_order_relaxed)) {}
 }
 
 void Viewport::setScore (arbitmod::Score score, double lookaheadBeats)
@@ -657,12 +1072,55 @@ void Viewport::setModMatrix (std::vector<arbitmod::Routing> routings)
     ++impl_->modGeneration;
 }
 
-void Viewport::setScript (std::string source, std::string lang)
+void Viewport::setControlPlan (videocontrol::Plan plan)
+{
+    if (impl_ == nullptr) return;
+    std::lock_guard<std::mutex> lock (impl_->mutex);
+    impl_->controlPlan = std::move(plan);
+    ++impl_->controlPlanGeneration;
+}
+
+bool Viewport::enqueueVisualEvent(std::string kind, int clipId,
+                                  uint64_t sequence, uint64_t epoch)
+{
+    if (impl_ == nullptr || clipId < 0
+        || (kind != "particleBurst" && kind != "generatorRetrigger"))
+        return false;
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (epoch < impl_->visualEventEpoch) return false;
+    if (epoch > impl_->visualEventEpoch)
+    {
+        impl_->visualEvents.clear();
+        impl_->visualEventLastSequences.clear();
+        impl_->visualEventEpoch = epoch;
+    }
+    const auto key = std::make_pair(kind, clipId);
+    if (const auto found = impl_->visualEventLastSequences.find(key);
+        found != impl_->visualEventLastSequences.end() && sequence <= found->second)
+        return true;
+    if (impl_->visualEvents.size() >= 64) return false;
+    impl_->visualEventLastSequences[key] = sequence;
+    impl_->visualEvents.push_back({ std::move(kind), clipId, sequence, epoch });
+    return true;
+}
+
+void Viewport::setBeatTimeline (videotime::BeatTimeline timeline)
+{
+    if (impl_ == nullptr) return;
+    std::lock_guard<std::mutex> lock (impl_->mutex);
+    impl_->beatTimeline = std::move(timeline);
+    ++impl_->beatTimelineGeneration;
+}
+
+void Viewport::setScript (std::string source, std::string lang,
+                          uint32_t cpuMs, uint32_t memoryMiB)
 {
     if (impl_ == nullptr) return;
     std::lock_guard<std::mutex> lock (impl_->mutex);
     impl_->scriptSource = std::move (source);
     impl_->scriptLang   = (lang == "lua") ? "lua" : "js";
+    impl_->scriptCpuMs = cpuMs;
+    impl_->scriptMemoryMiB = memoryMiB;
     ++impl_->scriptGeneration;
 }
 
@@ -869,11 +1327,59 @@ std::string Viewport::describeGraph() const
 {
     json nodes = json::array();
     json texts = json::array();
+    json segments = json::array();
+    json visualLayerPlans = json::array();
     arbitgl::GpuCaps caps;
+    const auto revisions = revisionState();
     if (impl_ != nullptr)
     {
         std::lock_guard<std::mutex> lock (impl_->mutex);
         caps = impl_->gpuCaps;
+        for (const auto& segment : impl_->segments)
+            segments.push_back ({
+                { "clipId", segment.clipId },
+                { "sourceKind", videowire::sourceKindToWire (segment.sourceKind) },
+                { "sourcePath", segment.sourcePath },
+                { "trackLayer", segment.trackLayer },
+                { "inSec", segment.inSec },
+                { "outSec", segment.outSec },
+                { "rate", segment.rate },
+                { "displayStartSec", segment.displayStartSec },
+                { "transitionType", segment.transitionType },
+                { "transitionDurationSec", segment.transitionDurationSec },
+                { "transitionFromClipId", segment.transitionFromClipId },
+                { "transitionToClipId", segment.transitionToClipId },
+                { "matteCacheKey", segment.matteCacheKey },
+                { "matteFps", segment.matteFps },
+                { "matteFrames", segment.matteFrames },
+            });
+        for (const auto& plan : impl_->visualPlanPublication->plans)
+        {
+            json edges = json::array();
+            for (const auto& edge : plan.edges)
+                edges.push_back({ { "fromNodeId", edge.fromNodeId }, { "fromPort", edge.fromPort },
+                                  { "toNodeId", edge.toNodeId }, { "toPort", edge.toPort } });
+            json ports = json::array();
+            for (const auto& port : plan.ports)
+                ports.push_back({ { "nodeId", port.nodeId }, { "port", port.port },
+                                  { "channels", port.channels }, { "direction", port.direction },
+                                  { "carrier", port.carrier }, { "dataType", port.dataType },
+                                  { "pixelFormat", port.pixelFormat }, { "colorSpace", port.colorSpace } });
+            json operations = json::array();
+            for (const auto& operation : plan.operations)
+                operations.push_back({ { "nodeId", operation.nodeId }, { "kind", operation.kind },
+                                       { "backendCapability", operation.backendCapability },
+                                       { "payloadXml", operation.payloadXml } });
+            visualLayerPlans.push_back ({
+                { "clipId", plan.clipId },
+                { "structuralRevision", plan.structuralRevision },
+                { "nodeKinds", plan.nodeKinds },
+                { "nodeIds", plan.nodeIds },
+                { "edges", std::move(edges) },
+                { "ports", std::move(ports) },
+                { "operations", std::move(operations) },
+            });
+        }
         for (const auto& [textId, t] : impl_->texts)
         {
             if (t.removed)
@@ -983,8 +1489,18 @@ std::string Viewport::describeGraph() const
                                        caps.maxComputeWorkGroupSize[2] } },
         { "maxComputeWorkGroupInvocations", caps.maxComputeWorkGroupInvocations },
     };
-    return json { { "nodes", nodes }, { "texts", texts },
-                  { "canvas", canvas }, { "gpu", gpu } }.dump();
+    return json { { "nodes", nodes }, { "texts", texts }, { "segments", segments },
+                  { "visualLayerPlans", visualLayerPlans },
+                  { "canvas", canvas }, { "gpu", gpu },
+                  { "structuralRevision", structuralRevision_.load (std::memory_order_acquire) },
+                  { "runtimeRevision", runtimeRevision_.load (std::memory_order_acquire) },
+                  { "authoringRevision", revisions.authoring },
+                  { "acceptedRevision", revisions.accepted },
+                  { "rejectedRevision", revisions.rejected },
+                  { "compiledRevision", revisions.compiled },
+                  { "lastGoodRevision", revisions.lastGood },
+                  { "exportableRevision", revisions.exportable },
+                  { "evaluationSequence", revisions.evaluation } }.dump();
 }
 
 ViewportInfo Viewport::info() const
@@ -1021,7 +1537,12 @@ ViewportInfo Viewport::info() const
     }
 #endif
     vi.interpTargetFps = interpTargetFps_.load (std::memory_order_relaxed);
-    vi.gpuPath = "opengl";
+    vi.gpuPath = impl_->gpuPath;
+    vi.backendPolicy = impl_->backendPolicy;
+    vi.compositorBackend = impl_->compositorBackend;
+    vi.particleBackend = impl_->particleBackend;
+    vi.rendererError = impl_->rendererError;
+    vi.fallbackCount = impl_->fallbackCount;
     vi.framesPresented = impl_->framesPresented.load();
     vi.lastFrameHash = impl_->lastFrameHash.load();
     vi.displaySec = impl_->displaySec;
@@ -1046,6 +1567,9 @@ ViewportInfo Viewport::info() const
     vi.sharedFreeBuffers = impl_->sharedFreeBuffers.load();
     vi.sharedBusyBuffers = impl_->sharedBusyBuffers.load();
     vi.gpuCaps = impl_->gpuCaps;
+    vi.graphTelemetry = impl_->visualTelemetry.snapshot();
+    vi.graphTelemetry.failedLowerings = impl_->failedPlanLowerings;
+    vi.graphTelemetry.lastLoweringError = impl_->lastPlanLoweringError;
     return vi;
 }
 
@@ -1152,80 +1676,92 @@ void Viewport::renderLoop (int width, int height, int x, int y,
     const bool shared = im.sharedMode;
     const bool shm = im.shmMode;
     const bool offscreen = shared || shm; // hidden window, no swapchain pacing
+    const bool metalOnly = shouldUseStrictMetalBackend (shared);
 
-    if (glfwInit() != GLFW_TRUE)
-    {
-        im.openError = "glfwInit failed (no display?)";
-        im.openDone = true;
-        return;
-    }
-
-    // OpenGL 4.3 core (4.1 on macOS, which caps desktop GL there) — the
-    // existing #version 330 shaders compile unchanged in a 4.3 core context;
-    // the bump unlocks compute/SSBO/image-load-store where available (P1).
+    GLFWwindow* win = nullptr;
+    bool windowOwnedByRenderThread = true;
 #if defined (__APPLE__)
-    glfwWindowHint (GLFW_CONTEXT_VERSION_MAJOR, 4);
-    glfwWindowHint (GLFW_CONTEXT_VERSION_MINOR, 1);
-#else
-    glfwWindowHint (GLFW_CONTEXT_VERSION_MAJOR, 4);
-    glfwWindowHint (GLFW_CONTEXT_VERSION_MINOR, 3);
-#endif
-    glfwWindowHint (GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    glfwWindowHint (GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE); // macOS requirement, harmless elsewhere
-    glfwWindowHint (GLFW_FLOATING, alwaysOnTop ? GLFW_TRUE : GLFW_FALSE);
-    glfwWindowHint (GLFW_RESIZABLE, GLFW_TRUE);
-    if (offscreen)
+    if (im.macPrecreatedWindow != nullptr)
     {
-        // Hidden window providing an offscreen context. We render into FBOs
-        // and never swap, so the window being unmapped is fine. shm mode
-        // deliberately takes the platform default context API (GLX/WGL/CGL
-        // all fine — readback is plain GL).
-        glfwWindowHint (GLFW_VISIBLE, GLFW_FALSE);
-#if ARBIT_HAVE_DMABUF && ! ARBIT_HAVE_VKFD
-        // dmabuf export needs an EGL-backed context (eglCreateImage +
-        // eglExportDMABUFImageMESA): on Wayland GLFW is EGL anyway, on X11
-        // the hint requests EGL-on-X11. The IOSurface/D3D11 exporters use
-        // the platform default (CGL/WGL). The VkFd backend imports via
-        // GL_EXT_memory_object_fd (core GL, GLX or EGL) so it does NOT force
-        // EGL — forcing EGL-on-X11 can fail on the NVIDIA driver, the very
-        // case VkFd exists to serve, so it is skipped when VkFd is compiled.
-        if (shared)
-            glfwWindowHint (GLFW_CONTEXT_CREATION_API, GLFW_EGL_CONTEXT_API);
-#endif
+        win = im.macPrecreatedWindow;
+        windowOwnedByRenderThread = false;
     }
-    GLFWwindow* win = glfwCreateWindow (width, height, "Arbit Video", nullptr, nullptr);
+#endif
     if (win == nullptr)
     {
-        im.openError = shared
-            ? "glfwCreateWindow failed (EGL GL 4.3 context unavailable?)"
-            : "glfwCreateWindow failed (GL 4.3 core unavailable?)";
+        if (glfwInit() != GLFW_TRUE)
+        {
+            im.openError = "glfwInit failed (no display?)";
+            im.openDone = true;
+            return;
+        }
+        configureGlfwWindowHints (offscreen, shared, alwaysOnTop, metalOnly);
+        win = glfwCreateWindow (width, height, "Arbit Video", nullptr, nullptr);
+    }
+    if (win == nullptr)
+    {
+        if (metalOnly)
+            im.openError = "glfwCreateWindow failed for the strict Metal viewport";
+        else
+            im.openError = shared
+                ? "glfwCreateWindow failed (EGL GL 4.3 context unavailable?)"
+                : "glfwCreateWindow failed (GL 4.3 core unavailable?)";
         glfwTerminate();
         im.openDone = true;
         return;
     }
     if (! offscreen && x >= 0 && y >= 0)
         glfwSetWindowPos (win, x, y);
-    glfwMakeContextCurrent (win);
-    glfwSwapInterval (offscreen ? 0 : 1); // window mode: vsync paces the loop
+    if (! metalOnly)
+    {
+        glfwMakeContextCurrent (win);
+        glfwSwapInterval (offscreen ? 0 : 1); // window mode: vsync paces the loop
+    }
+
+    const auto releaseWindow = [&]
+    {
+        if (! metalOnly)
+            glfwMakeContextCurrent (nullptr);
+        if (windowOwnedByRenderThread)
+        {
+            glfwDestroyWindow (win);
+            glfwTerminate();
+        }
+    };
 
     arbitgl::GlFuncs gl;
     std::string missing;
-    if (! arbitgl::loadGlFunctions (gl, missing))
+    if (! metalOnly && ! arbitgl::loadGlFunctions (gl, missing))
     {
         im.openError = "GL core loader failed, missing: " + missing;
-        glfwDestroyWindow (win);
-        glfwTerminate();
+        releaseWindow();
         im.openDone = true;
         return;
     }
     // P1: soft-load the optional 4.3 entry points and snapshot the caps once.
-    arbitgl::loadGl43Functions (gl);
+    if (! metalOnly)
     {
+        arbitgl::loadGl43Functions (gl);
         arbitgl::GpuCaps caps;
         arbitgl::queryGpuCaps (gl, caps);
         std::lock_guard<std::mutex> lock (im.mutex);
         im.gpuCaps = caps;
     }
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    else
+    {
+        // The wire struct predates the native backend and retains GL-shaped
+        // field names. In a Metal-only viewport these booleans describe the
+        // equivalent production capabilities used by feature gates.
+        arbitgl::GpuCaps caps;
+        caps.computeShaders = true;
+        caps.ssbo = true;
+        caps.imageLoadStore = true;
+        caps.particles = true;
+        std::lock_guard<std::mutex> lock (im.mutex);
+        im.gpuCaps = caps;
+    }
+#endif
 
     // Shrink an shm render size to what one ring slot can hold (aspect kept).
     auto clampToSlot = [&im] (int& w, int& h)
@@ -1254,29 +1790,92 @@ void Viewport::renderLoop (int width, int height, int x, int y,
         glfwGetFramebufferSize (win, &fbW, &fbH);
 
     std::string rendererError;
-    if (! renderer.initialize (&gl, std::max (fbW, 1), std::max (fbH, 1), rendererError))
+    if (! renderer.initialize (metalOnly ? nullptr : &gl,
+                               std::max (fbW, 1), std::max (fbH, 1),
+                               rendererError, metalOnly))
     {
         im.openError = "renderer init failed: " + rendererError;
-        glfwDestroyWindow (win);
-        glfwTerminate();
+        releaseWindow();
         im.openDone = true;
         return;
     }
+    videowire::ViewportTelemetryOwner<> viewportTelemetry (im.visualTelemetry, metalOnly);
+    renderer.setVisualTelemetryOwner(&im.visualTelemetry);
+    const auto admittedBackend = metalOnly ? videowire::VisualBackend::metal
+                                           : videowire::VisualBackend::openGL;
+    if (! viewportTelemetry.admitBackend (admittedBackend))
+    {
+        im.openError = "viewport telemetry rejected production backend admission";
+        renderer.shutdown();
+        releaseWindow();
+        im.openDone = true;
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock (im.mutex);
+        im.gpuPath = metalOnly ? "metal" : "opengl";
+        im.backendPolicy = metalOnly ? "strict-metal" : "legacy-opengl";
+        im.fallbackCount = 0;
+    }
+
+#if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
+    std::unique_ptr<MacMetalViewportSurface> localMetalSurface;
+    if (metalOnly && ! shared)
+    {
+        localMetalSurface = std::make_unique<MacMetalViewportSurface>();
+        if (! localMetalSurface->initialize (win, fbW, fbH, ! offscreen, rendererError))
+        {
+            im.openError = "Metal viewport init failed: " + rendererError;
+            renderer.shutdown();
+            releaseWindow();
+            im.openDone = true;
+            return;
+        }
+    }
+#endif
 
 #if ARBIT_HAVE_GPU_SHARED
     // Shared-mode bring-up: capability probe, exported buffer ring, fd socket.
-    auto destroySharedBuffers = [&im]
+    auto destroySharedBuffers = [&im, &renderer, &viewportTelemetry]
     {
+#if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
+        renderer.clearMetalDirectOutputs();
+#endif
         for (auto& b : im.buffers)
+        {
+            if (b.width > 0 && b.height > 0)
+            {
+                uint64_t allocationBytes = 0;
+#if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
+                if (b.surface != nullptr)
+                    allocationBytes = IOSurfaceGetAllocSize (static_cast<IOSurfaceRef> (b.surface));
+#endif
+                viewportTelemetry.exportedBufferReleased (allocationBytes);
+            }
             im.exporter.destroy (b);
+        }
         im.buffers.clear();
+        viewportTelemetry.exportedBufferPoolClosed();
     };
-    auto allocateSharedBuffers = [&im] (int w, int h, std::string& err) -> bool
+    auto allocateSharedBuffers = [&im, &viewportTelemetry] (int w, int h, std::string& err) -> bool
     {
         im.buffers.resize ((size_t) im.sharedBufferCount);
         for (auto& b : im.buffers)
             if (! im.exporter.allocate (b, w, h, err))
                 return false;
+            else
+            {
+                uint64_t allocationBytes = 0;
+#if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
+                if (b.surface != nullptr)
+                    allocationBytes = IOSurfaceGetAllocSize (static_cast<IOSurfaceRef> (b.surface));
+#endif
+                if (! viewportTelemetry.exportedBufferAllocated (allocationBytes))
+                {
+                    err = "exported buffer telemetry resource accounting overflow";
+                    return false;
+                }
+            }
         return true;
     };
     auto sendBuffers = [&im]
@@ -1322,12 +1921,11 @@ void Viewport::renderLoop (int width, int height, int x, int y,
     if (shared)
     {
         std::string err;
-        if (! im.exporter.initialize (&gl, err))
+        if (! im.exporter.initialize (metalOnly ? nullptr : &gl, err))
         {
             im.openError = "no shared-GPU export support: " + err;
             renderer.shutdown();
-            glfwDestroyWindow (win);
-            glfwTerminate();
+            releaseWindow();
             im.openDone = true;
             return;
         }
@@ -1341,8 +1939,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             im.fdSocket.close();
             im.exporter.shutdown();
             renderer.shutdown();
-            glfwDestroyWindow (win);
-            glfwTerminate();
+            releaseWindow();
             im.openDone = true;
             return;
         }
@@ -1373,6 +1970,19 @@ void Viewport::renderLoop (int width, int height, int x, int y,
     {
         std::string path;
         std::unique_ptr<MediaContext> media;
+        std::string matteDir;
+        std::unique_ptr<MediaContext> matteMedia;
+        std::unique_ptr<MediaContext> matteMediaB;
+        bool matteOpenFailed = false;
+        bool matteOpenFailedB = false;
+        unsigned matteTex = 0;
+        unsigned matteTexB = 0;
+        videohelper::DepthTextureState depth;
+        int matteTexW = 0, matteTexH = 0;
+        int matteTexWB = 0, matteTexHB = 0;
+        double matteLastSrcSec = -1.0e9;
+        double matteLastSrcSecB = -1.0e9;
+        std::string matteReceipt, matteReceiptB;
         unsigned tex = 0;
         int texW = 0, texH = 0;
         double lastSrcSec = -1.0e9; // pts of the uploaded frame
@@ -1394,6 +2004,9 @@ void Viewport::renderLoop (int width, int height, int x, int y,
     };
     std::map<int, ClipStream> streams; // render-thread only, keyed by clipId
     uint64_t streamsGeneration = ~0ull;
+    auto frameVisualPlans = im.visualPlanPublication; // render-thread frame lease
+    std::vector<videowire::VisualEventScheduleBinding> frameVisualScheduleBindings;
+    videowire::VisualEventTriggerCursor visualEventCursor (false);
 
     // One gathered layer = an active segment + a params snapshot (+ optional
     // transition A side).
@@ -1416,17 +2029,30 @@ void Viewport::renderLoop (int width, int height, int x, int y,
         // pixels come from the shader/effect path, not a MediaContext. Skip
         // decode (matches the exporter). Live shader rendering in the viewport
         // is a later slice; for now the layer is simply empty here.
-        if (s.sourcePath.rfind ("gen://", 0) == 0)
+        if (videowire::resolveSourceKind (s.sourceKind, s.isAdjustment, s.sourcePath)
+            != videowire::SourceKind::Media)
             return nullptr;
 
         auto& cs = streams[s.clipId];
         if (cs.path != s.sourcePath || cs.seqFps != s.sourceFps || cs.seqStart != s.seqStart)
         {
+            renderer.deleteTexture(cs.matteTex);
+            renderer.deleteTexture(cs.matteTexB);
+            cs.matteTex = cs.matteTexB = 0;
+            cs.depth.clear(renderer);
             cs.media.reset();
+            cs.matteMedia.reset();
+            cs.matteMediaB.reset();
             cs.path = s.sourcePath;
             cs.seqFps = s.sourceFps;
             cs.seqStart = s.seqStart;
             cs.openFailed = false;
+            cs.matteOpenFailed = false;
+            cs.matteOpenFailedB = false;
+            cs.matteTexW = cs.matteTexH = 0;
+            cs.matteTexWB = cs.matteTexHB = 0;
+            cs.matteLastSrcSec = -1.0e9;
+            cs.matteLastSrcSecB = -1.0e9;
             cs.texW = 0;
             cs.lastSrcSec = -1.0e9;
             cs.blendPairValid = false;
@@ -1446,6 +2072,24 @@ void Viewport::renderLoop (int width, int height, int x, int y,
 
         const double fps = std::max (cs.media->info().fps, 1.0);
 
+        if (cs.matteDir != s.matteDir)
+        {
+            cs.matteDir = s.matteDir;
+            cs.matteMedia.reset();
+            cs.matteOpenFailed = false;
+        }
+        if (! s.matteDir.empty() && cs.matteMedia == nullptr && ! cs.matteOpenFailed)
+        {
+            cs.matteMedia = std::make_unique<MediaContext>();
+            std::string validatedDir, pattern, matteError;
+            const double matteFps = s.matteFps > 0.0 ? s.matteFps : fps;
+            if (! videowire::revalidateMatteForOpen(s, validatedDir, pattern, matteError)
+                || ! cs.matteMedia->open(pattern, false, matteFps, s.matteFirstFrame).empty())
+            {
+                cs.matteMedia.reset();
+                cs.matteOpenFailed = true;
+            }
+        }
         // Should this segment be interpolated this frame? Two regimes:
         //   * Project target FPS set (interpTargetFps_ > 0): frame-rate
         //     up-conversion — interpolate whenever the segment's effective
@@ -1617,6 +2261,9 @@ void Viewport::renderLoop (int width, int height, int x, int y,
         {
             if (cs.media->getFrame (srcSec, 1920, 1080, df).empty() && df.width > 0)
             {
+                if (cs.matteMedia != nullptr
+                    && ! videowire::visualPlanUsesTypedMatte(frameVisualPlans->plans, s.clipId))
+                    applyAlphaMatte (df, *cs.matteMedia, srcSec);
                 cs.tex = renderer.uploadRgba (df.rgba.data(), df.width, df.height,
                                               df.strideBytes, cs.tex);
                 cs.texW = df.width;
@@ -1626,6 +2273,74 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             }
         }
         return cs.texW > 0 ? &cs : nullptr;
+    };
+
+    auto uploadTypedMatte = [&] (const ViewportSegment& segment, ClipStream& stream,
+                                 double sourceSec) -> bool
+    {
+        if (! videowire::visualPlanUsesTypedMatte(frameVisualPlans->plans, segment.clipId))
+            return true;
+        if (stream.matteReceipt != segment.matteContentReceipt)
+        {
+            renderer.deleteTexture(stream.matteTex); stream.matteTex = 0;
+            stream.matteMedia.reset(); stream.matteOpenFailed = false;
+            stream.matteTexW = stream.matteTexH = 0;
+            stream.matteReceipt = segment.matteContentReceipt;
+            std::string dir, pattern, error;
+            stream.matteMedia = std::make_unique<MediaContext>();
+            if (!videowire::revalidateMatteForOpen(segment, dir, pattern, error)
+                || !stream.matteMedia->open(pattern, false, segment.matteFps,
+                                            segment.matteFirstFrame).empty())
+            { stream.matteMedia.reset(); stream.matteOpenFailed = true; }
+        }
+        if (stream.matteMedia == nullptr) return false;
+        videowire::RenderSegment secondary;
+        const bool combined = videowire::visualPlanSecondaryMatte(
+            frameVisualPlans->plans, segment.clipId, segment, secondary);
+        if (combined && stream.matteReceiptB != secondary.matteContentReceipt)
+        {
+            renderer.deleteTexture(stream.matteTexB); stream.matteTexB = 0;
+            stream.matteMediaB.reset(); stream.matteOpenFailedB = false;
+            stream.matteTexWB = stream.matteTexHB = 0;
+            stream.matteReceiptB = secondary.matteContentReceipt;
+        }
+        if (combined && stream.matteMediaB == nullptr && !stream.matteOpenFailedB)
+        {
+            std::string dir, pattern, error;
+            stream.matteMediaB = std::make_unique<MediaContext>();
+            if (!videowire::revalidateMatteForOpen(secondary, dir, pattern, error)
+                || !stream.matteMediaB->open(pattern, false, secondary.matteFps,
+                                             secondary.matteFirstFrame).empty())
+            { stream.matteMediaB.reset(); stream.matteOpenFailedB = true; }
+        }
+        if (combined && stream.matteMediaB == nullptr) return false;
+        const double fps = segment.matteFps > 0.0 ? segment.matteFps : 1.0;
+        if (stream.matteTexW == 0
+            || std::abs(sourceSec - stream.matteLastSrcSec) >= 0.5 / fps)
+        {
+            DecodedFrame matteFrame;
+            if (! stream.matteMedia->getFrame(sourceSec, stream.texW, stream.texH, matteFrame).empty()
+                || matteFrame.width <= 0 || matteFrame.height <= 0 || matteFrame.rgba.empty())
+                return false;
+            stream.matteTex = renderer.uploadRgba(matteFrame.rgba.data(), matteFrame.width,
+                                                  matteFrame.height, matteFrame.strideBytes,
+                                                  stream.matteTex);
+            stream.matteTexW = matteFrame.width;
+            stream.matteTexH = matteFrame.height;
+            stream.matteLastSrcSec = matteFrame.ptsSec;
+        }
+        if (combined && (stream.matteTexWB == 0
+            || std::abs(sourceSec - stream.matteLastSrcSecB) >= 0.5 / secondary.matteFps))
+        {
+            DecodedFrame frame;
+            if (!stream.matteMediaB->getFrame(sourceSec, stream.texW, stream.texH, frame).empty()
+                || frame.width <= 0 || frame.height <= 0 || frame.rgba.empty()) return false;
+            stream.matteTexB = renderer.uploadRgba(frame.rgba.data(), frame.width, frame.height,
+                                                   frame.strideBytes, stream.matteTexB);
+            stream.matteTexWB = frame.width; stream.matteTexHB = frame.height;
+            stream.matteLastSrcSecB = frame.ptsSec;
+        }
+        return stream.matteTex != 0 && (!combined || stream.matteTexB != 0);
     };
 
     // Common per-clip params (everything except the source texture) — shared by
@@ -1707,6 +2422,10 @@ void Viewport::renderLoop (int width, int height, int x, int y,
     std::vector<arbitmod::RoutingState> routingStates;
     uint64_t modGenSeen = ~0ull;
     long modAdvancedFrame = -1;
+    videocontrol::Plan localControlPlan;
+    videocontrol::Executor controlExecutor;
+    std::vector<videocontrol::SinkValue> controlSinkValues;
+    uint64_t controlPlanGenSeen = ~0ull;
 
     // P2 Scripts-tab per-frame hook (render-thread owned). The selected engine is
     // (re)compiled only when the script set changes; scriptOverrides holds the
@@ -1720,6 +2439,8 @@ void Viewport::renderLoop (int width, int height, int x, int y,
     arbitjs::JsHook   scriptJs;
     std::string localScriptSource;
     std::string localScriptLang;
+    uint32_t localScriptCpuMs = 0;
+    uint32_t localScriptMemoryMiB = 0;
     uint64_t scriptGenSeen = ~0ull;
     bool scriptActive = false;          // a hook compiled OK and has frame()
     bool scriptWantJs = true;           // which engine the current source selects
@@ -1752,18 +2473,38 @@ void Viewport::renderLoop (int width, int height, int x, int y,
     std::vector<arbitblockb::FeatureFrame> localPreviewFeats;
     double localPreviewSr = 0.0;
     uint64_t previewMixGenSeen = ~0ull;
+    videotime::BeatTimeline localBeatTimeline;
+    videotime::BeatTimeline legacyBeatTimeline;
+    uint64_t beatTimelineGenSeen = ~0ull;
 
     int frameCounter = 0;
     int glErrorsLogged = 0;
     int64_t nextTickNs = nowNs(); // shared-mode pacing (no vsync without a swap)
     int64_t nextScopeNs = 0;      // ~10 Hz scope readback pacing
     std::vector<uint8_t> scopeRgba; // scope readback scratch, reused
+    std::vector<Impl::VisualEvent> frameVisualEvents;
+    frameVisualEvents.reserve(64);
 
-    while (running_.load() && ! im.wantClose.load() && ! glfwWindowShouldClose (win))
+    while (running_.load() && ! im.wantClose.load()
+           && (offscreen || ! glfwWindowShouldClose (win)))
     {
-        glfwPollEvents();
+        frameVisualEvents.clear();
+        {
+            std::lock_guard<std::mutex> lock(im.mutex);
+            frameVisualEvents.swap(im.visualEvents);
+        }
+        // Hidden shared/shm contexts have no OS-window events to process. On
+        // macOS glfwPollEvents is main-thread-only, while rendering legitimately
+        // owns the detached GL context on this worker thread.
+        if (! offscreen)
+        {
+#if ! defined (__APPLE__)
+            glfwPollEvents();
+#endif
+        }
 
         // Window control requests from the RPC thread (window mode only).
+#if ! defined (__APPLE__)
         if (! offscreen)
         {
             if (im.boundsDirty.exchange (false))
@@ -1784,6 +2525,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                 glfwSetWindowMonitor (win, nullptr, 100, 100, width, height, 0);
             }
         }
+#endif
 
         // shm-mode resize: just a render-size change — frames self-describe
         // their dims per slot, so no ring renegotiation is needed as long as
@@ -1878,6 +2620,11 @@ void Viewport::renderLoop (int width, int height, int x, int y,
         bool haveClock = false;
         {
             std::lock_guard<std::mutex> lock (im.mutex);
+            if (im.beatTimelineGeneration != beatTimelineGenSeen)
+            {
+                localBeatTimeline = im.beatTimeline;
+                beatTimelineGenSeen = im.beatTimelineGeneration;
+            }
             for (int attempt = 0; attempt < 3 && ! haveClock; ++attempt)
                 haveClock = im.transport.isOpen() && im.transport.read (tb);
         }
@@ -1897,16 +2644,29 @@ void Viewport::renderLoop (int width, int height, int x, int y,
         bool playing = false;
         if (haveClock)
         {
-            bpm = tb.bpm > 0.0 ? tb.bpm : 120.0;
-            beatsPerBar = tb.beatsPerBar > 0.0 ? tb.beatsPerBar : 4.0;
             playing = tb.playing != 0;
-            double beats = tb.playheadBeats;
-            if (playing)
+            if (beatTimelineGenSeen != 0)
             {
-                const double elapsed = (double) (frameStartNs - tb.hostTimeNs) * 1e-9;
-                beats += std::max (0.0, std::min (elapsed, 0.5)) * bpm / 60.0;
+                const double elapsed = playing
+                    ? std::max(0.0, std::min(
+                        (double) (frameStartNs - tb.hostTimeNs) * 1e-9, 0.5)) : 0.0;
+                displaySec = localBeatTimeline.beatToSeconds(tb.playheadBeats) + elapsed;
+                const auto frameClock = localBeatTimeline.clockAtSeconds(displaySec);
+                bpm = frameClock.bpm;
+                beatsPerBar = frameClock.beatsPerBar;
             }
-            displaySec = beats * 60.0 / bpm;
+            else
+            {
+                bpm = tb.bpm > 0.0 ? tb.bpm : 120.0;
+                beatsPerBar = tb.beatsPerBar > 0.0 ? tb.beatsPerBar : 4.0;
+                double beats = tb.playheadBeats;
+                if (playing)
+                {
+                    const double elapsed = (double) (frameStartNs - tb.hostTimeNs) * 1e-9;
+                    beats += std::max (0.0, std::min (elapsed, 0.5)) * bpm / 60.0;
+                }
+                displaySec = beats * 60.0 / bpm;
+            }
         }
         // Frame-perfect (faithful preview): snap the value-path clock to the
         // project frame grid so the live frame is sampled at exactly the time
@@ -1919,6 +2679,14 @@ void Viewport::renderLoop (int width, int height, int x, int y,
         // steps. Snapping a zero/paused displaySec is harmless (rounds to a grid
         // point), and matches what the exporter would render for that region.
         displaySec = (double) std::llround (displaySec * valueFps) / valueFps;
+        if (beatTimelineGenSeen == 0)
+            legacyBeatTimeline.reset(bpm, beatsPerBar);
+        const auto& activeBeatTimeline = beatTimelineGenSeen != 0
+            ? localBeatTimeline : legacyBeatTimeline;
+        const auto snappedClock = activeBeatTimeline.clockAtSeconds(displaySec);
+        const double displayBeat = snappedClock.beat;
+        bpm = snappedClock.bpm;
+        beatsPerBar = snappedClock.beatsPerBar;
         {
             std::lock_guard<std::mutex> lock (im.mutex);
             im.displaySec = displaySec;
@@ -2048,6 +2816,17 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             for (size_t i = 0; i < cachedAudioFeatures.bands.size() && i < 64; ++i)
                 liveAud.bands[i] = cachedAudioFeatures.bands[i];
         }
+        if (haveClock)
+        {
+            liveAud.sourceCount = std::min<int>((int) tb.trackFeatureCount,
+                                                 (int) liveAud.sources.size());
+            for (int i = 0; i < liveAud.sourceCount; ++i)
+            {
+                const auto& source = tb.trackFeatures[i];
+                liveAud.sources[(size_t) i] = { source.trackId, (int) source.tapPoint,
+                                                source.rms, source.peak, source.onset };
+            }
+        }
 
         // --- Gather every segment active at displaySec + transition sources.
         std::vector<ActiveLayer> act;
@@ -2058,7 +2837,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             std::lock_guard<std::mutex> lock (im.mutex);
 
             // Apply pending timestamped params whose beat has passed.
-            const double playheadBeats = haveClock ? displaySec * bpm / 60.0 : 0.0;
+            const double playheadBeats = haveClock ? displayBeat : 0.0;
             auto& pend = im.pendingParams;
             pend.erase (std::remove_if (pend.begin(), pend.end(),
                 [&] (const PendingParam& pp)
@@ -2073,6 +2852,8 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                 }), pend.end());
 
             timelineGen = im.timelineGeneration;
+            frameVisualPlans = im.visualPlanPublication;
+            frameVisualScheduleBindings = im.visualEventSchedules;
             if (timelineGen != streamsGeneration)
                 for (const auto& s : im.segments)
                     liveClipIds.insert (s.clipId);
@@ -2099,6 +2880,17 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                 routingStates.assign (localRoutings.size(), arbitmod::RoutingState {});
                 modAdvancedFrame = -1;
             }
+            if (im.controlPlanGeneration != controlPlanGenSeen)
+            {
+                localControlPlan = im.controlPlan;
+                controlPlanGenSeen = im.controlPlanGeneration;
+                std::string controlError;
+                if (!controlExecutor.bind(localControlPlan, controlError))
+                    std::fprintf(stderr, "[viewport] rejected video control plan: %s\n",
+                                 controlError.c_str());
+                controlSinkValues.clear();
+                modAdvancedFrame = -1;
+            }
 
             // P2: re-copy + recompile the per-frame script hook only when the
             // script set changed (compiling is the heavy step — never per frame).
@@ -2110,6 +2902,8 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             {
                 localScriptSource = im.scriptSource;
                 localScriptLang   = im.scriptLang;
+                localScriptCpuMs = im.scriptCpuMs;
+                localScriptMemoryMiB = im.scriptMemoryMiB;
                 scriptGenSeen     = im.scriptGeneration;
                 scriptActive      = false;
                 scriptWantJs      = (localScriptLang != "lua");
@@ -2122,8 +2916,8 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                 {
                     std::string serr;
                     scriptActive = scriptWantJs
-                        ? scriptJs.compile (localScriptSource, serr)
-                        : scriptLua.compile (localScriptSource, serr);
+                        ? scriptJs.compile (localScriptSource, serr, localScriptCpuMs, localScriptMemoryMiB)
+                        : scriptLua.compile (localScriptSource, serr, localScriptCpuMs, localScriptMemoryMiB);
                     if (! scriptActive)
                         std::fprintf (stderr, "[%s] live hook disabled: %s\n",
                                       scriptWantJs ? "js" : "lua", serr.c_str());
@@ -2139,11 +2933,11 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             // score-sourced routings see the live notes. The warm-up window is
             // sized to the slowest smoother's convergence (see below) so the
             // smoothed value matches the frame-0-warmed export to epsilon.
-            if (! localRoutings.empty())
+            if (! localRoutings.empty() || !controlExecutor.empty())
             {
                 const double clkFps = valueFps;  // project value-grid fps (== export job.fps)
                 const long g = (long) std::llround (displaySec * clkFps);
-                const double dtBeats = (1.0 / clkFps) * bpm / 60.0;
+
                 // Playhead seeked backward (scrub-back, looping, or a viewport
                 // reopen whose first frame renders at the previous playhead before
                 // the user seeks earlier): modAdvancedFrame is monotonic, so
@@ -2152,7 +2946,12 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                 // at its last position (the live mod matrix appears stuck). Reset
                 // so the ~1 s warm-up window re-runs ending at the new frame.
                 if (g < modAdvancedFrame)
+                {
                     modAdvancedFrame = -1;
+                    routingStates.assign(localRoutings.size(), arbitmod::RoutingState {});
+                    controlExecutor.reset();
+                    controlSinkValues.clear();
+                }
                 // Warm-up window (audit #13): a flat ~1s was too short for slow
                 // one-pole smoothers, so the first preview frames after a play-
                 // start / seek differed from the export (which warms from frame
@@ -2171,8 +2970,10 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                 if (maxTauBeats > 0.0f)
                 {
                     const double warmBeats = 9.2 * (double) maxTauBeats;
-                    warmFrames = (long) std::ceil (warmBeats * 60.0 * clkFps
-                                                   / std::max (bpm, 1.0));
+                    const double warmStartBeat = std::max(0.0, displayBeat - warmBeats);
+                    const double warmSeconds = displaySec
+                        - activeBeatTimeline.beatToSeconds(warmStartBeat);
+                    warmFrames = (long) std::ceil(std::max(0.0, warmSeconds) * clkFps);
                     warmFrames = std::min (warmFrames,
                                            (long) std::llround (clkFps * 30.0));
                 }
@@ -2180,10 +2981,14 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                 const arbitmod::Audio zeroAud {};
                 for (long f = startF; f <= g; ++f)
                 {
+                    const double frameSec = (double) f / clkFps;
+                    const auto frameClock = activeBeatTimeline.clockAtSeconds(frameSec);
+                    const double dtBeats = activeBeatTimeline.secondsToBeat(
+                        frameSec + 1.0 / clkFps) - frameClock.beat;
                     arbitmod::Clock clk;
-                    clk.beat        = (float) ((double) f / clkFps * bpm / 60.0);
-                    clk.bpm         = (float) bpm;
-                    clk.beatsPerBar = (float) beatsPerBar;
+                    clk.beat        = (float) frameClock.beat;
+                    clk.bpm         = (float) frameClock.bpm;
+                    clk.beatsPerBar = (float) frameClock.beatsPerBar;
                     // Audio per frame. While PLAYING only the current frame has real
                     // (live-ring) audio; warm-up frames have no history → zero-fed.
                     // While STOPPED with a baked mix, feed EVERY frame the offline
@@ -2209,6 +3014,10 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                         arbitmod::evaluateRouting (localRoutings[ri], routingStates[ri],
                                                    0.0f, localScore, clk, *audPtr, (float) dtBeats);
                     }
+                    const auto& sinks = controlExecutor.evaluate(
+                        localScore, clk, *audPtr, static_cast<float>(dtBeats),
+                        static_cast<float>(1.0 / clkFps));
+                    controlSinkValues.assign(sinks.begin(), sinks.end());
                 }
                 if (g > modAdvancedFrame) modAdvancedFrame = g;
             }
@@ -2230,7 +3039,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                     scriptRanFrame = g;
                     arbitlua::FrameCtx ctx;
                     ctx.t           = displaySec;
-                    ctx.beat        = displaySec * bpm / 60.0;
+                    ctx.beat        = displayBeat;
                     ctx.bpm         = bpm;
                     ctx.beatsPerBar = beatsPerBar;
                     ctx.frame       = g;
@@ -2314,6 +3123,18 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                                    arbitmod::combine (r.mode, (float) base,
                                                       routingStates[ri].smoothed));
                 }
+                for (const auto& sink : controlSinkValues)
+                {
+                    if (!sink.enabled) continue;
+                    int cid; std::string node, par;
+                    if (!Impl::parseParamId(sink.destination, cid, node, par) || cid != clipId)
+                        continue;
+                    double base = 0.0;
+                    if (!Impl::readFrom(p, node, par, base)) continue;
+                    Impl::applyTo(p, node, par,
+                                  arbitmod::combine(sink.mode, static_cast<float>(base),
+                                                    sink.value));
+                }
                 // P2: the per-frame script hook is the TOP layer — apply this
                 // frame's overrides for THIS clip after static/baked/mod-matrix
                 // (mirrors exporter.cpp::stateAt). scriptOverrides was computed
@@ -2350,27 +3171,14 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                         (displaySec - s.displayStartSec) / s.transitionDurationSec,
                         0.0, 1.0);
 
-                    // A = the previous segment on the same trackLayer when it
-                    // abuts/overlaps; otherwise A stays empty (= black).
-                    const ViewportSegment* best = nullptr;
-                    for (const auto& c : im.segments)
-                        if (&c != &s && c.trackLayer == s.trackLayer
-                            && c.displayStartSec < s.displayStartSec
-                            && (best == nullptr
-                                || c.displayStartSec > best->displayStartSec))
-                            best = &c;
+                    const ViewportSegment* best =
+                        videowire::resolveTransitionFrom (im.segments, s, kAbutEps);
                     if (best != nullptr)
                     {
-                        const double bestDur =
-                            (best->outSec - best->inSec) / std::max (best->rate, 1e-9);
-                        if (best->displayStartSec + bestDur
-                            >= s.displayStartSec - kAbutEps)
-                        {
-                            al.haveFrom = true;
-                            al.fromSeg = *best;
-                            al.fromParams = *im.paramsFor (best->clipId);
-                            overlayMods (al.fromParams, best->clipId);
-                        }
+                        al.haveFrom = true;
+                        al.fromSeg = *best;
+                        al.fromParams = *im.paramsFor (best->clipId);
+                        overlayMods (al.fromParams, best->clipId);
                     }
                 }
                 act.push_back (std::move (al));
@@ -2585,6 +3393,20 @@ void Viewport::renderLoop (int width, int height, int x, int y,
         std::vector<videorender::LayerDesc> fromDescs;
         descs.reserve (act.size());
         fromDescs.reserve (act.size()); // stable: fromLayer pointers held by descs
+        const videowire::VisualInspectionTarget inspectionTarget {
+            im.inspectionClipId, im.inspectionStructuralRevision,
+            im.inspectionNodeId, im.inspectionOutputPort };
+        videowire::VisualInspectionResource inspectionResource;
+        renderer.setTransformInspectionClip (-1);
+        if (const auto* inspectionPlan = videowire::findVisualLayerPlan(
+                frameVisualPlans->plans, inspectionTarget.clipId);
+            inspectionPlan != nullptr
+            && inspectionPlan->structuralRevision == inspectionTarget.structuralRevision
+            && (videowire::classifyVisualInspectionTarget(*inspectionPlan, inspectionTarget)
+                    == videowire::VisualInspectionSlice::transformedLayer
+                || videowire::classifyVisualInspectionTarget(*inspectionPlan, inspectionTarget)
+                    == videowire::VisualInspectionSlice::retainedDrawShape))
+            renderer.setTransformInspectionClip (inspectionTarget.clipId);
         bool haveMain = false;
         double mainPts = 0.0, mainIdeal = 0.0;
 
@@ -2596,7 +3418,10 @@ void Viewport::renderLoop (int width, int height, int x, int y,
         std::set<int> shaderClips;
         for (const auto& al : act)
         {
-            if (al.seg.shaderSource.empty())
+            if (videowire::resolveSourceKind (al.seg.sourceKind, al.seg.isAdjustment,
+                                              al.seg.sourcePath)
+                    != videowire::SourceKind::Shader
+                || al.seg.shaderSource.empty())
                 continue;
             const auto it = shaderCompiled.find (al.seg.clipId);
             if (it == shaderCompiled.end() || it->second != al.seg.shaderSource)
@@ -2617,6 +3442,25 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                     for (int k = 0; k < nc; ++k)
                         defs[gp.name + videorender::genParamComponentSuffix (gp.type, k)] =
                             (nc == 1) ? gp.defaultV : gp.defaultVec[k];
+                    if (gp.type == 5)
+                    {
+                        std::string path = gp.importedPath;
+                        if (const auto image = al.seg.genImages.find(gp.name);
+                            image != al.seg.genImages.end() && ! image->second.empty())
+                            path = image->second;
+                        if (! path.empty())
+                        {
+                            MediaContext media;
+                            DecodedFrame frame;
+                            if (media.open(path, false).empty()
+                                && media.getFrame(0.0, cw > 0 ? cw : 1920,
+                                                  ch > 0 ? ch : 1080, frame).empty()
+                                && ! frame.rgba.empty())
+                                renderer.setClipImage(al.seg.clipId, gp.name,
+                                    frame.rgba.data(), frame.width, frame.height,
+                                    frame.strideBytes);
+                        }
+                    }
                 }
             }
             if (renderer.hasClipShader (al.seg.clipId))
@@ -2628,12 +3472,14 @@ void Viewport::renderLoop (int width, int height, int x, int y,
         // shader clip present.
         bool haveParticleClip = false;
         for (const auto& al : act)
-            if (al.seg.sourcePath.rfind ("gen://particles", 0) == 0)
+            if (videowire::resolveSourceKind (al.seg.sourceKind, al.seg.isAdjustment,
+                                              al.seg.sourcePath)
+                == videowire::SourceKind::Particles)
             { haveParticleClip = true; break; }
 
         // M5: pack the live Block C score once per timeline frame (only when a
         // shader or particle clip is on-screen to read it). The packed beat
-        // matches makeShaderClock (displaySec·bpm/60); re-packing a held frame is
+        // matches makeShaderClock's shared beat timeline; re-packing a held frame is
         // skipped via scorePackedFrame so a paused/repeated frame stays stable.
         const bool haveScore = (! shaderClips.empty() || haveParticleClip)
                              && ! localScore.notes.empty();
@@ -2643,9 +3489,8 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             const long g = (long) std::llround (displaySec * clkFps);
             if (g != scorePackedFrame)
             {
-                const double beat = displaySec * bpm / 60.0;
                 const arbitblockc::PackResult pr = scorePacker.pack (
-                    localScore, (float) beat, (float) localScoreLookahead);
+                    localScore, (float) displayBeat, (float) localScoreLookahead);
                 cachedNoteFeatures.notesTex  = pr.notesTex;
                 cachedNoteFeatures.linksTex  = pr.linksTex;
                 cachedNoteFeatures.noteCount = pr.noteCount;
@@ -2655,15 +3500,65 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             }
         }
 
+        auto prepareDecodedDesc = [&] (const ViewportSegment& segment,
+                                       const ClipGraphParams& params,
+                                       double sourceSec,
+                                       videorender::LayerDesc& desc,
+                                       ClipStream*& stream) -> bool
+        {
+            stream = decodeLayer(segment, sourceSec);
+            if (stream == nullptr) return false;
+            fillDesc(desc, params, *stream, displaySec, segment.clipId);
+            std::string planError;
+            if (! uploadTypedMatte(segment, *stream, sourceSec))
+                planError = "typed matte asset frame is unavailable";
+            else
+            {
+                desc.matteTexture = stream->matteTex;
+                desc.matteWidth = stream->matteTexW;
+                desc.matteHeight = stream->matteTexH;
+                desc.matteTextureB = stream->matteTexB;
+                desc.matteWidthB = stream->matteTexWB;
+                desc.matteHeightB = stream->matteTexHB;
+                if (!videohelper::prepareDepthTexture(im.depthCacheRoot, frameVisualPlans->plans,
+                        segment.clipId, sourceSec, 1, renderer, stream->depth, desc, planError))
+                {
+                    // Executable depth is strict; the caller closes the viewport below.
+                }
+                else if (!videohelper::trackingruntime::prepareTracking(im.depthCacheRoot,
+                        frameVisualPlans->plans, segment.clipId, sourceSec, desc, planError))
+                {
+                    // Tracking receipts are equally strict and never auto-regenerated.
+                }
+                else if (videowire::executeVisualLayerPlan(
+                        frameVisualPlans->plans, segment.clipId, desc, planError,
+                        &inspectionTarget, &inspectionResource,
+                        &frameVisualPlans->state, displaySec,
+                        &frameVisualScheduleBindings, &visualEventCursor))
+                    return true;
+            }
+            std::fprintf(stderr, "[viewport] visual plan execution rejected: %s\n",
+                         planError.c_str());
+            {
+                std::lock_guard<std::mutex> lock(im.mutex);
+                im.rendererError = planError;
+            }
+            im.wantClose = true;
+            return false;
+        };
+
         for (const auto& al : act)
         {
             if (al.params.visible < 0.5f || al.params.opacity <= 0.001f)
                 continue;
 
             videorender::LayerDesc d;
-            const bool isAdjustment = al.seg.sourcePath.rfind ("gen://adjustment", 0) == 0;
-            const bool isParticles  = al.seg.sourcePath.rfind ("gen://particles", 0) == 0;
-            const bool isShader = ! isAdjustment && ! isParticles
+            bool planExecuted = false;
+            const auto sourceKind = videowire::resolveSourceKind (
+                al.seg.sourceKind, al.seg.isAdjustment, al.seg.sourcePath);
+            const bool isAdjustment = sourceKind == videowire::SourceKind::Adjustment;
+            const bool isParticles = sourceKind == videowire::SourceKind::Particles;
+            const bool isShader = sourceKind == videowire::SourceKind::Shader
                                && shaderClips.count (al.seg.clipId) > 0;
             ClipStream* cs = nullptr;
             double srcSec = 0.0;
@@ -2692,7 +3587,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                     (displaySec - al.seg.displayStartSec) * clkFps);
                 d.shaderSource = true;
                 d.shaderClock = videorender::makeShaderClock (
-                    displaySec, al.seg.displayStartSec, segDur, bpm, beatsPerBar,
+                    displaySec, al.seg.displayStartSec, segDur, activeBeatTimeline,
                     clkFps, playing, frameIdx);
                 fillDescCommon (d, al.params, displaySec, al.seg.clipId);
                 if (haveScore)
@@ -2719,7 +3614,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                     (displaySec - al.seg.displayStartSec) * clkFps);
                 d.particleSource = true;
                 d.shaderClock = videorender::makeShaderClock (
-                    displaySec, al.seg.displayStartSec, segDur, bpm, beatsPerBar,
+                    displaySec, al.seg.displayStartSec, segDur, activeBeatTimeline,
                     clkFps, playing, frameIdx);
                 fillDescCommon (d, al.params, displaySec, al.seg.clipId);
                 if (haveScore)
@@ -2732,11 +3627,37 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             {
                 srcSec = al.seg.inSec
                     + (displaySec - al.seg.displayStartSec) * al.seg.rate;
-                cs = decodeLayer (al.seg, srcSec);
-                if (cs == nullptr)
+                if (! prepareDecodedDesc(al.seg, al.params, srcSec, d, cs))
+                {
+                    if (im.wantClose.load()) break;
                     continue;
-                fillDesc (d, al.params, *cs, displaySec, al.seg.clipId);
+                }
+                planExecuted = true;
             }
+
+            std::string planError;
+            if (! planExecuted && ! videowire::executeVisualLayerPlan (
+                    frameVisualPlans->plans, al.seg.clipId, d, planError,
+                    &inspectionTarget, &inspectionResource,
+                    &frameVisualPlans->state, displaySec,
+                    &frameVisualScheduleBindings, &visualEventCursor))
+            {
+                std::fprintf (stderr, "[viewport] visual plan execution rejected: %s\n",
+                              planError.c_str());
+                {
+                    std::lock_guard<std::mutex> lock (im.mutex);
+                    im.rendererError = planError;
+                }
+                im.wantClose = true;
+                break;
+            }
+
+            for (const auto& event : frameVisualEvents)
+                if (event.clipId == al.seg.clipId)
+                {
+                    d.feedbackHistoryReset = true;
+                    if (event.kind == "particleBurst") d.particleStateReset = true;
+                }
 
             if (al.transitionActive)
             {
@@ -2752,13 +3673,14 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                         + (displaySec - al.fromSeg.displayStartSec) * al.fromSeg.rate;
                     fromSrc = std::clamp (fromSrc, al.fromSeg.inSec,
                                           std::max (al.fromSeg.inSec, al.fromSeg.outSec));
-                    if (ClipStream* fs = decodeLayer (al.fromSeg, fromSrc))
+                    ClipStream* fs = nullptr;
+                    videorender::LayerDesc fd;
+                    if (prepareDecodedDesc(al.fromSeg, al.fromParams, fromSrc, fd, fs))
                     {
-                        videorender::LayerDesc fd;
-                        fillDesc (fd, al.fromParams, *fs, displaySec, al.fromSeg.clipId);
                         fromDescs.push_back (fd);
                         d.fromLayer = &fromDescs.back();
                     }
+                    else if (im.wantClose.load()) break;
                 }
             }
 
@@ -2770,26 +3692,318 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             }
             descs.push_back (d);
         }
+        if (im.wantClose.load())
+            continue; // strict plan rejection never presents a partial frame
 
-        // --- Composite + present. An empty layer list still renders the
-        // background so the composited hash always reflects the frame shown.
+        // --- Composite + present. On macOS shared viewports the free ring
+        // IOSurface is the Metal render target itself: no Metal->GL->IOSurface
+        // bridge and no fallback copy are permitted on this path.
+        bool directMetalFrame = false;
+        const bool requireDirectMetal =
+#if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
+            metalOnly;
+#else
+            false;
+#endif
+#if ARBIT_HAVE_GPU_SHARED
+        gpuexp::ExportedBuffer* directTarget = nullptr;
+#endif
+#if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
+        void* directSurface = nullptr;
+        int directWidth = fbW;
+        int directHeight = fbH;
+        if (metalOnly && ! shared && localMetalSurface != nullptr)
+        {
+            std::string surfaceError;
+            if (! localMetalSurface->resize (fbW, fbH, surfaceError))
+            {
+                std::fprintf (stderr, "[viewport] strict Metal resize failed: %s\n",
+                              surfaceError.c_str());
+                {
+                    std::lock_guard<std::mutex> lock (im.mutex);
+                    im.compositorBackend = "metal-zero-copy-rejected";
+                    im.rendererError = surfaceError;
+                }
+                im.wantClose = true;
+                continue;
+            }
+            directSurface = localMetalSurface->ioSurface();
+            directWidth = localMetalSurface->width();
+            directHeight = localMetalSurface->height();
+        }
+        if (shared)
+        {
+            int freeBuffers = 0, busyBuffers = 0;
+            for (auto& buffer : im.buffers)
+                if (buffer.busy) ++busyBuffers;
+                else
+                {
+                    ++freeBuffers;
+                    if (directTarget == nullptr) directTarget = &buffer;
+                }
+            im.sharedFreeBuffers = freeBuffers;
+            im.sharedBusyBuffers = busyBuffers;
+            if (directTarget != nullptr)
+            {
+                directSurface = directTarget->surface;
+                directWidth = directTarget->width;
+                directHeight = directTarget->height;
+            }
+        }
+        if (directSurface != nullptr)
+        {
+            videopreview::State metalPreviewState;
+            {
+                std::lock_guard<std::mutex> lock (im.mutex);
+                metalPreviewState = im.inspectionPresentation;
+            }
+            unsigned requestedInspectionHandle = inspectionResource.handle;
+            if (const auto* plan = videowire::findVisualLayerPlan(
+                    frameVisualPlans->plans, inspectionTarget.clipId);
+                plan != nullptr
+                && videowire::classifyVisualInspectionTarget(*plan, inspectionTarget)
+                    == videowire::VisualInspectionSlice::terminalComposite)
+                requestedInspectionHandle = 0xffffffffu;
+            renderer.setMetalInspectionPresentation (requestedInspectionHandle,
+                                                      metalPreviewState);
+            directMetalFrame = viewportTelemetry.renderComposite ([&]
+            {
+                return renderer.renderCompositeToIOSurface (
+                    directSurface, directWidth, directHeight,
+                    descs.data(), (int) descs.size(),
+                    overlays.data(), (int) overlays.size());
+            }, [] (bool valid) { return valid; });
+        }
+        if (requireDirectMetal && directSurface != nullptr && ! directMetalFrame)
+        {
+            std::fprintf (stderr, "[viewport] strict Metal compositor rejected frame\n");
+            {
+                std::lock_guard<std::mutex> lock (im.mutex);
+                im.compositorBackend = renderer.compositorBackend();
+                im.rendererError = "strict Metal compositor rejected frame";
+            }
+            im.wantClose = true;
+            continue;
+        }
+#endif
+        const bool hashThisFrame = (frameCounter++ & 3) == 0;
+#if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
+        // The strict Metal compositor has already completed its GPU work before
+        // returning. Read auxiliary diagnostics directly from the IOSurface
+        // that is about to be handed to the consumer: presentation remains
+        // zero-copy and no OpenGL/CPU compositor is introduced.
+        if (directMetalFrame && directSurface != nullptr
+            && (hashThisFrame || scopeMask_.load() != 0))
+        {
+            const uint32_t scopes = scopeMask_.load();
+            const int64_t scopeNow = nowNs();
+            const bool readScopes = scopes != 0 && scopeNow >= nextScopeNs;
+            IOSurfaceRef surface = static_cast<IOSurfaceRef> (directSurface);
+            if (surface != nullptr
+                && IOSurfaceLock (surface, kIOSurfaceLockReadOnly, nullptr) == 0)
+            {
+                const auto* bgra = static_cast<const uint8_t*> (IOSurfaceGetBaseAddress (surface));
+                const int surfaceW = static_cast<int> (IOSurfaceGetWidth (surface));
+                const int surfaceH = static_cast<int> (IOSurfaceGetHeight (surface));
+                const size_t rowBytes = IOSurfaceGetBytesPerRow (surface);
+                if (bgra != nullptr && surfaceW > 0 && surfaceH > 0)
+                {
+                    if (hashThisFrame)
+                    {
+                        uint64_t hash = 1469598103934665603ull;
+                        const size_t maxPixels = std::min<size_t> (
+                            static_cast<size_t> (surfaceW) * surfaceH, (1024u * 1024u) / 4u);
+                        for (size_t pixel = 0; pixel < maxPixels; ++pixel)
+                        {
+                            const size_t y = pixel / static_cast<size_t> (surfaceW);
+                            const size_t x = pixel % static_cast<size_t> (surfaceW);
+                            const uint8_t* source = bgra + y * rowBytes + x * 4;
+                            const uint8_t rgbaPixel[4] = {
+                                source[2], source[1], source[0], source[3] };
+                            for (const uint8_t value : rgbaPixel)
+                            {
+                                hash ^= value;
+                                hash *= 1099511628211ull;
+                            }
+                        }
+                        im.lastFrameHash = hash;
+                    }
+                    if (readScopes)
+                    {
+                        scopeRgba.resize (static_cast<size_t> (
+                            videorender::FrameRenderer::kScopeW)
+                            * videorender::FrameRenderer::kScopeH * 4);
+                        for (int y = 0; y < videorender::FrameRenderer::kScopeH; ++y)
+                        {
+                            const int sy = std::min (surfaceH - 1,
+                                y * surfaceH / videorender::FrameRenderer::kScopeH);
+                            for (int x = 0; x < videorender::FrameRenderer::kScopeW; ++x)
+                            {
+                                const int sx = std::min (surfaceW - 1,
+                                    x * surfaceW / videorender::FrameRenderer::kScopeW);
+                                const uint8_t* source = bgra + static_cast<size_t> (sy) * rowBytes
+                                                      + static_cast<size_t> (sx) * 4;
+                                uint8_t* dest = scopeRgba.data()
+                                    + (static_cast<size_t> (y) * videorender::FrameRenderer::kScopeW
+                                       + x) * 4;
+                                dest[0] = source[2]; dest[1] = source[1];
+                                dest[2] = source[0]; dest[3] = source[3];
+                            }
+                        }
+                        im.computeScopes (scopes, scopeRgba.data(),
+                                          videorender::FrameRenderer::kScopeW,
+                                          videorender::FrameRenderer::kScopeH);
+                        nextScopeNs = scopeNow + 100'000'000ll;
+                    }
+                }
+                IOSurfaceUnlock (surface, kIOSurfaceLockReadOnly, nullptr);
+            }
+        }
+#endif
         const unsigned compositeTex =
-            renderer.renderComposite (descs.data(), (int) descs.size(),
-                                      overlays.data(), (int) overlays.size());
+#if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
+            metalOnly ? 0u :
+#endif
+            viewportTelemetry.renderComposite ([&]
+            {
+                return renderer.renderComposite (descs.data(), (int) descs.size(),
+                                                 overlays.data(), (int) overlays.size());
+            }, [] (unsigned texture) { return texture != 0; });
+        if (! metalOnly && compositeTex == 0)
+        {
+            std::lock_guard<std::mutex> lock (im.mutex);
+            im.rendererError = "OpenGL compositor rejected frame";
+            continue;
+        }
+        {
+            std::lock_guard<std::mutex> lock (im.mutex);
+            im.particleBackend = renderer.particleBackend();
+            im.compositorBackend = renderer.compositorBackend();
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+            im.inspectionMetalAdmitted = renderer.metalInspectionResourceAdmitted();
+#else
+            im.inspectionMetalAdmitted = false;
+#endif
+            const auto* inspectionPlan = videowire::findVisualLayerPlan(
+                frameVisualPlans->plans, im.inspectionClipId);
+            bool terminalResource = false;
+            if (inspectionPlan != nullptr
+                && inspectionPlan->structuralRevision == im.inspectionStructuralRevision)
+            {
+                const auto output = std::find_if(inspectionPlan->operations.begin(),
+                    inspectionPlan->operations.end(), [](const auto& operation)
+                    { return operation.kind == "video.out"; });
+                if (output != inspectionPlan->operations.end())
+                    terminalResource = std::any_of(inspectionPlan->edges.begin(),
+                        inspectionPlan->edges.end(), [&](const auto& edge)
+                        {
+                            return edge.fromNodeId == im.inspectionNodeId
+                                && edge.toNodeId == output->nodeId;
+                        });
+            }
+            const bool terminalReady = terminalResource
+                && (compositeTex != 0 || im.compositorBackend.find("metal") != std::string::npos);
+            const auto inspectionSlice = inspectionPlan != nullptr
+                    && inspectionPlan->structuralRevision == inspectionTarget.structuralRevision
+                ? videowire::classifyVisualInspectionTarget(*inspectionPlan, inspectionTarget)
+                : videowire::VisualInspectionSlice::unsupported;
+            const bool transformedReady = (inspectionSlice
+                    == videowire::VisualInspectionSlice::transformedLayer
+                || inspectionSlice == videowire::VisualInspectionSlice::retainedDrawShape)
+                && renderer.transformInspectionTexture() != 0;
+            if (transformedReady)
+            {
+                inspectionResource.handle = renderer.transformInspectionTexture();
+                inspectionResource.width = cw > 0 ? cw : fbW;
+                inspectionResource.height = ch > 0 ? ch : fbH;
+                inspectionResource.nodeId = im.inspectionNodeId;
+                inspectionResource.outputPort = im.inspectionOutputPort;
+            }
+            const bool nonTerminalReady = inspectionResource.handle != 0
+                && inspectionResource.nodeId == im.inspectionNodeId
+                && inspectionResource.outputPort == im.inspectionOutputPort;
+            im.inspectionResourceReady = terminalReady || nonTerminalReady;
+            im.inspectionResourceHandle = nonTerminalReady ? inspectionResource.handle
+                                                           : compositeTex;
+            if (im.inspectionResourceReady)
+            {
+                ++im.inspectionResourceGeneration;
+                im.inspectionResourceWidth = nonTerminalReady
+                    ? inspectionResource.width : (cw > 0 ? cw : fbW);
+                im.inspectionResourceHeight = nonTerminalReady
+                    ? inspectionResource.height : (ch > 0 ? ch : fbH);
+                im.inspectionResourceBackend = transformedReady
+                    ? im.compositorBackend
+                        + (inspectionSlice == videowire::VisualInspectionSlice::retainedDrawShape
+                            ? "-draw-shape-target" : "-transform-target")
+                    : (nonTerminalReady ? im.compositorBackend + "-decoded-source"
+                                        : im.compositorBackend);
+            }
+        }
         // Report which retime tier actually drew this frame (1=frame-blend).
         im.interpBackend.store (interpTierThisFrame, std::memory_order_relaxed);
         // Export-frame border + overscan dim (viewport-only; no-op when no
         // canvas is set). presentTex is what the user sees; scopes keep
         // measuring the undecorated composite.
-        const unsigned presentTex = renderer.applyCanvasFrame (compositeTex);
+        videopreview::State previewState;
+        unsigned previewTexture = 0;
+        {
+            std::lock_guard<std::mutex> lock(im.mutex);
+            previewState = im.inspectionPresentation;
+            if (im.inspectionResourceReady) previewTexture = im.inspectionResourceHandle;
+        }
+        const unsigned presentTex = requireDirectMetal ? 0u
+            : (previewState.layout != videopreview::Layout::hidden && previewTexture != 0
+                ? renderer.applyNodePreview(compositeTex, previewTexture, previewState)
+                : (canvasFrameEnabled_.load() ? renderer.applyCanvasFrame(compositeTex)
+                                              : compositeTex));
         if (! offscreen)
-            renderer.presentToWindow (presentTex, fbW, fbH);
+        {
+#if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
+            if (metalOnly)
+            {
+                std::string presentError;
+                if (! viewportTelemetry.present ([&]
+                    { return localMetalSurface != nullptr
+                          && localMetalSurface->present (presentError); }))
+                {
+                    std::fprintf (stderr, "[viewport] strict Metal present failed: %s\n",
+                                  presentError.c_str());
+                    {
+                        std::lock_guard<std::mutex> lock (im.mutex);
+                        im.compositorBackend = "metal-present-rejected";
+                        im.rendererError = presentError;
+                    }
+                    im.wantClose = true;
+                    continue;
+                }
+            }
+            else
+#endif
+            {
+                while (glGetError() != GL_NO_ERROR) {}
+                glfwGetError (nullptr);
+                const bool presented = viewportTelemetry.present ([&]
+                {
+                    if (! renderer.presentToWindow (presentTex, fbW, fbH)) return false;
+                    glfwSwapBuffers (win);
+                    const char* glfwDescription = nullptr;
+                    return glfwGetError (&glfwDescription) == GLFW_NO_ERROR;
+                });
+                if (! presented)
+                {
+                    std::lock_guard<std::mutex> lock (im.mutex);
+                    im.rendererError = "OpenGL window presentation failed";
+                    continue;
+                }
+            }
+        }
 
         // frameHash = async PBO hash of the undecorated composite (canvas-res,
         // == the export's composite for A/B parity; the hash readback region is
         // sized to outW_, which is now the canvas, so this must be the composite,
         // not the window-res presentTex — audit #16).
-        if ((frameCounter++ & 3) == 0)
+        if (! requireDirectMetal && hashThisFrame)
         {
             uint64_t h = 0;
             if (renderer.hashComposite (compositeTex, h))
@@ -2798,7 +4012,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
 
         // Video scopes (PROTOCOL.md §Scopes): downscaled async readback of
         // the same composited frame, ~10 Hz, ONLY while a scope is enabled.
-        if (const uint32_t scopes = scopeMask_.load(); scopes != 0)
+        if (const uint32_t scopes = scopeMask_.load(); ! requireDirectMetal && scopes != 0)
         {
             const int64_t tScope = nowNs();
             if (tScope >= nextScopeNs)
@@ -2811,12 +4025,13 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             }
         }
 
-        for (GLenum err = glGetError(); err != GL_NO_ERROR; err = glGetError())
-            if (glErrorsLogged < 16)
-            {
-                std::fprintf (stderr, "[viewport] GL error 0x%04x\n", err);
-                ++glErrorsLogged;
-            }
+        if (! metalOnly)
+            for (GLenum err = glGetError(); err != GL_NO_ERROR; err = glGetError())
+                if (glErrorsLogged < 16)
+                {
+                    std::fprintf (stderr, "[viewport] GL error 0x%04x\n", err);
+                    ++glErrorsLogged;
+                }
 
         // A/V offset: presented frame pts vs the ideal source time.
         if (haveMain)
@@ -2828,40 +4043,104 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                 im.avOffsetSec = mainPts - mainIdeal;
         }
 
-        if (! offscreen)
-            glfwSwapBuffers (win);
-        else if (shm)
+        if (offscreen && shm)
         {
-            // Pipelined PBO readback (one frame of latency): map the
-            // previous frame's pixels and seqlock-write them into the next
-            // ring slot. Round-robin slots; the reader scans for the highest
-            // per-slot frameSeq (SlotHeader.reserved[0/1]) with an even
-            // generation, so a torn slot is simply skipped.
-            int pw = 0, ph = 0;
-            if (const uint8_t* px = renderer.beginMappedReadback (presentTex, pw, ph))
+#if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
+            if (metalOnly)
             {
-                auto* hdr = im.shmRing.header();
-                const size_t bytes = (size_t) pw * (size_t) ph * 4;
-                if (hdr != nullptr && hdr->slotCount > 0 && bytes > 0
-                    && bytes <= hdr->slotBytes)
+                IOSurfaceRef surface = static_cast<IOSurfaceRef> (directSurface);
+                if (directMetalFrame && surface != nullptr
+                    && IOSurfaceLock (surface, kIOSurfaceLockReadOnly, nullptr) == 0)
                 {
-                    const uint32_t idx = im.shmSlotCursor++ % hdr->slotCount;
-                    auto* slot = im.shmRing.slot (idx);
-                    slot->generation.fetch_add (1, std::memory_order_acq_rel); // odd
-                    slot->width = (uint32_t) pw;
-                    slot->height = (uint32_t) ph;
-                    slot->strideBytes = (uint32_t) pw * 4;
-                    slot->ptsSec = displaySec;
-                    slot->mediaId = 0;
-                    const uint64_t seq = ++im.shmFrameSeq;
-                    slot->reserved[0] = (uint32_t) (seq & 0xffffffffu);
-                    slot->reserved[1] = (uint32_t) (seq >> 32);
-                    slot->reserved[2] = 1; // payload format: BGRA8, top row first
-                    std::memcpy (im.shmRing.slotPayload (idx), px, bytes);
-                    slot->generation.fetch_add (1, std::memory_order_acq_rel); // even
-                    im.sharedFramesSent.fetch_add (1);
+                    auto* hdr = im.shmRing.header();
+                    const int pw = static_cast<int> (IOSurfaceGetWidth (surface));
+                    const int ph = static_cast<int> (IOSurfaceGetHeight (surface));
+                    const size_t sourceStride = IOSurfaceGetBytesPerRow (surface);
+                    const auto* pixels = static_cast<const uint8_t*> (
+                        IOSurfaceGetBaseAddress (surface));
+                    const size_t rowBytes = static_cast<size_t> (pw) * 4;
+                    uint64_t checkedBytes = 0;
+                    const bool payloadSizeValid = viewportTelemetry.checkedPayloadBytes (
+                        rowBytes, ph, checkedBytes)
+                        && checkedBytes <= std::numeric_limits<size_t>::max();
+                    if (hdr != nullptr && hdr->slotCount > 0 && pixels != nullptr
+                        && sourceStride >= rowBytes && payloadSizeValid
+                        && checkedBytes <= hdr->slotBytes)
+                    {
+                        const uint32_t idx = im.shmSlotCursor++ % hdr->slotCount;
+                        auto* slot = im.shmRing.slot (idx);
+                        slot->generation.fetch_add (1, std::memory_order_acq_rel);
+                        slot->width = static_cast<uint32_t> (pw);
+                        slot->height = static_cast<uint32_t> (ph);
+                        slot->strideBytes = static_cast<uint32_t> (rowBytes);
+                        slot->ptsSec = displaySec;
+                        slot->mediaId = 0;
+                        const uint64_t seq = ++im.shmFrameSeq;
+                        slot->reserved[0] = static_cast<uint32_t> (seq);
+                        slot->reserved[1] = static_cast<uint32_t> (seq >> 32);
+                        slot->reserved[2] = 1;
+                        auto* destination = im.shmRing.slotPayload (idx);
+                        for (int row = 0; row < ph; ++row)
+                            std::memcpy (destination + static_cast<size_t> (row) * rowBytes,
+                                         pixels + static_cast<size_t> (row) * sourceStride,
+                                         rowBytes);
+                        slot->generation.fetch_add (1, std::memory_order_acq_rel);
+                        im.sharedFramesSent.fetch_add (1);
+                        viewportTelemetry.readbackCopied (true, rowBytes, ph,
+                            fbW, fbH, pw, ph);
+                    }
+                    else
+                        viewportTelemetry.readbackCopied (false, rowBytes, ph,
+                            fbW, fbH, pw, ph);
+                    IOSurfaceUnlock (surface, kIOSurfaceLockReadOnly, nullptr);
                 }
-                renderer.endMappedReadback();
+            }
+            else
+#endif
+            {
+                // Pipelined PBO readback (one frame of latency): map the
+                // previous frame's pixels and seqlock-write them into the next
+                // ring slot. Round-robin slots; the reader scans for the highest
+                // per-slot frameSeq (SlotHeader.reserved[0/1]) with an even
+                // generation, so a torn slot is simply skipped.
+                int pw = 0, ph = 0;
+                if (const uint8_t* px = renderer.beginMappedReadback (presentTex, pw, ph))
+                {
+                    auto* hdr = im.shmRing.header();
+                    const size_t stride = pw > 0 ? static_cast<size_t> (pw) * 4u : 0;
+                    uint64_t checkedBytes = 0;
+                    const bool payloadSizeValid = viewportTelemetry.checkedPayloadBytes (
+                        stride, ph, checkedBytes)
+                        && checkedBytes <= std::numeric_limits<size_t>::max();
+                    if (hdr != nullptr && hdr->slotCount > 0 && payloadSizeValid
+                        && checkedBytes <= hdr->slotBytes)
+                    {
+                        const uint32_t idx = im.shmSlotCursor++ % hdr->slotCount;
+                        auto* slot = im.shmRing.slot (idx);
+                        slot->generation.fetch_add (1, std::memory_order_acq_rel); // odd
+                        slot->width = (uint32_t) pw;
+                        slot->height = (uint32_t) ph;
+                        slot->strideBytes = (uint32_t) pw * 4;
+                        slot->ptsSec = displaySec;
+                        slot->mediaId = 0;
+                        const uint64_t seq = ++im.shmFrameSeq;
+                        slot->reserved[0] = (uint32_t) (seq & 0xffffffffu);
+                        slot->reserved[1] = (uint32_t) (seq >> 32);
+                        slot->reserved[2] = 1; // payload format: BGRA8, top row first
+                        std::memcpy (im.shmRing.slotPayload (idx), px,
+                                     static_cast<size_t> (checkedBytes));
+                        slot->generation.fetch_add (1, std::memory_order_acq_rel); // even
+                        im.sharedFramesSent.fetch_add (1);
+                        viewportTelemetry.readbackCopied (true,
+                            static_cast<size_t> (slot->strideBytes), ph,
+                            fbW, fbH, pw, ph);
+                    }
+                    else
+                        viewportTelemetry.readbackCopied (false,
+                            static_cast<size_t> (pw > 0 ? pw : 0) * 4u, ph,
+                            fbW, fbH, pw, ph);
+                    renderer.endMappedReadback();
+                }
             }
         }
 #if ARBIT_HAVE_GPU_SHARED
@@ -2873,7 +4152,11 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             // without stalling our pipeline; fallback: glFinish as in v1),
             // announce. A buffer that has been announced and not yet released
             // is never written — when none are free the frame is dropped.
-            gpuexp::ExportedBuffer* target = nullptr;
+            gpuexp::ExportedBuffer* target =
+#if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
+                directMetalFrame ? directTarget : nullptr;
+#else
+                nullptr;
             int freeBuffers = 0;
             int busyBuffers = 0;
             for (auto& b : im.buffers)
@@ -2889,12 +4172,18 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             }
             im.sharedFreeBuffers = freeBuffers;
             im.sharedBusyBuffers = busyBuffers;
+#endif
             if (target != nullptr)
             {
-                im.exporter.blit (presentTex, *target);
+                bool blitSucceeded = true;
+#if ! (defined(__APPLE__) && ARBIT_HAVE_IOSURFACE)
+                blitSucceeded = im.exporter.blit (presentTex, *target);
+#endif
 
-                int fenceFd = im.exporter.createNativeFenceFd();
-                if (fenceFd < 0)
+                const bool fenceRequired = im.exporter.fenceSyncAvailable();
+                int fenceFd = blitSucceeded ? im.exporter.createNativeFenceFd() : -1;
+                const bool fenceSucceeded = ! fenceRequired || fenceFd >= 0;
+                if (fenceFd < 0 && ! directMetalFrame && ! fenceRequired && blitSucceeded)
                     glFinish();
 
                 gpusurf::FrameReadyPayload ready;
@@ -2903,21 +4192,29 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                 ready.frameSeq = ++im.frameSeq;
                 ready.displaySec = displaySec;
                 ready.frameHash = im.lastFrameHash.load();
-                const bool sent = im.fdSocket.sendMsg (
+                const bool sent = blitSucceeded && fenceSucceeded && im.fdSocket.sendMsg (
                     (uint32_t) gpusurf::MsgType::FrameReady, &ready, sizeof (ready),
                     fenceFd >= 0 ? &fenceFd : nullptr, fenceFd >= 0 ? 1 : 0);
                 if (fenceFd >= 0)
                     closeFdIfValid (fenceFd); // sendmsg dup'ed it (or send failed)
-                if (sent)
+                const bool handedOff = viewportTelemetry.zeroCopyHandoff (
+                    blitSucceeded, fenceSucceeded, sent);
+                if (handedOff)
                 {
                     target->busy = true;
                     im.sharedFramesSent.fetch_add (1);
                 }
                 else
-                    im.fdSocket.dropClient(); // send failed: treat as gone
+                {
+                    if (blitSucceeded && fenceSucceeded)
+                        im.fdSocket.dropClient(); // socket send failed: treat as gone
+                }
             }
             else
+            {
                 im.sharedFramesDroppedNoBuffer.fetch_add (1);
+                viewportTelemetry.noFreeExportedBuffer();
+            }
         }
 #endif // ARBIT_HAVE_GPU_SHARED
         im.framesPresented.fetch_add (1);
@@ -2955,6 +4252,9 @@ void Viewport::renderLoop (int width, int height, int x, int y,
         renderer.deleteTexture (cs.tex);
         renderer.deleteTexture (cs.texA);   // frame-blend brackets
         renderer.deleteTexture (cs.texB);
+        renderer.deleteTexture (cs.matteTex);
+        renderer.deleteTexture (cs.matteTexB);
+        cs.depth.clear(renderer);
     }
     streams.clear();
 #if ARBIT_HAVE_ONNX || ARBIT_HAVE_NCNN
@@ -2993,6 +4293,8 @@ void Viewport::renderLoop (int width, int height, int x, int y,
     }
 #endif
     renderer.shutdown();
-    glfwDestroyWindow (win);
-    glfwTerminate();
+#if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
+    localMetalSurface.reset();
+#endif
+    releaseWindow();
 }

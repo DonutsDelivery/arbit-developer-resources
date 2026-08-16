@@ -26,6 +26,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -155,14 +156,32 @@ struct Score
     }
 };
 
-// Tier-3 audio features (non-deterministic; passed in from Block B / shm).
+struct AudioFeatureSource
+{
+    int trackId = -1;
+    int tapPoint = 0;
+    float rms = 0.0f;
+    float peak = 0.0f;
+    float onset = 0.0f;
+};
+
+// Tier-3 audio features. Master comes from Block B; bounded per-track/group
+// typed scalars come from transport shm without exposing raw audio rings.
 struct Audio
 {
     float rms   = 0.0f;
     float peak  = 0.0f;
     float onset = 0.0f;
     float bands[64] = {};
+    std::array<AudioFeatureSource, 8> sources {};
+    int sourceCount = 0;
     float band (int i) const { return (i >= 0 && i < 64) ? bands[i] : 0.0f; }
+    const AudioFeatureSource* sourceFor(int trackId) const noexcept
+    {
+        for (int i = 0; i < sourceCount && i < (int) sources.size(); ++i)
+            if (sources[(size_t) i].trackId == trackId) return &sources[(size_t) i];
+        return nullptr;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -524,10 +543,17 @@ inline float evaluateSource (const ModSource& s, const Score& score,
             return lfoAt (s.lfo.shape, refBeat, period, phase0, s.lfo.seed);
         }
 
-        case SourceType::AudioRms:   return clamp01 (audio.rms);
-        case SourceType::AudioPeak:  return clamp01 (audio.peak);
-        case SourceType::AudioOnset: return clamp01 (audio.onset);
-        case SourceType::AudioBand:  return clamp01 (audio.band (s.band));
+        case SourceType::AudioRms:
+            if (const auto* f = audio.sourceFor(s.trackId)) return clamp01(f->rms);
+            return s.trackId < 0 ? clamp01(audio.rms) : 0.0f;
+        case SourceType::AudioPeak:
+            if (const auto* f = audio.sourceFor(s.trackId)) return clamp01(f->peak);
+            return s.trackId < 0 ? clamp01(audio.peak) : 0.0f;
+        case SourceType::AudioOnset:
+            if (const auto* f = audio.sourceFor(s.trackId)) return clamp01(f->onset);
+            return s.trackId < 0 ? clamp01(audio.onset) : 0.0f;
+        case SourceType::AudioBand:
+            return s.trackId < 0 ? clamp01(audio.band(s.band)) : 0.0f;
     }
     return 0.0f;
 }

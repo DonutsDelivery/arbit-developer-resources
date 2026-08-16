@@ -33,6 +33,7 @@
 
 #if ARBIT_HAVE_VIEWPORT
 
+#include <memory>
 #include <string>
 
 namespace arbitgl { struct GlFuncs; }
@@ -42,29 +43,50 @@ namespace videorender
 
 struct ShaderClock;    // shader_generator.h (Block A clock; shared formula)
 struct NoteFeatures;   // shader_generator.h (Block C packed score)
+#if defined (__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+class MetalParticleEngine;
+#endif
 
 // v1 particle params. These ride the clip's genParams map ("clip<id>/gen/<name>")
 // exactly like a shader's ISF INPUTs, so they serialize + mod-route for free; the
 // renderer unpacks them from LayerDesc::genParams into this struct per frame.
 struct ParticleParams
 {
-    int   count      = 512;    // pool size (clamped to [1, kMaxParticles])
+    int   count      = 512;    // pool size (legacy clips clamp to kMaxParticles)
     int   spawnTrack = 0;      // track whose notes seed/colour/force particles
     float size       = 2.0f;   // point sprite size in px
     float gravity    = 0.0f;   // downward acceleration (screen units / s^2)
     float force      = 1.0f;   // note-velocity -> spawn-velocity scale
+    int   seed       = 0;      // deterministic curated-source seed
+    float lifetime   = 0.0f;   // seconds; <= 0 keeps note-reactive legacy range
+    float red = -1.0f, green = -1.0f, blue = -1.0f, alpha = 1.0f; // red < 0 keeps hue
+};
+
+// Populated only when ARBIT_PARTICLE_DIAGNOSTICS=1. This keeps production free
+// of synchronous readbacks while letting the native smoke localise blank output.
+struct ParticleDiagnostics
+{
+    int noteRows = 0;
+    int liveParticles = -1;       // simulation state before rasterisation
+    int visibleCandidates = -1;   // live particles with finite in-range positions
+    int drawAlphaPixels = -1;     // backend target before bridge/readback
+    int readbackAlphaPixels = -1; // texture returned to the GL caller
 };
 
 class ParticleEngine
 {
 public:
-    ParticleEngine() = default;
+    ParticleEngine();
     ~ParticleEngine();
     ParticleEngine (const ParticleEngine&) = delete;
     ParticleEngine& operator= (const ParticleEngine&) = delete;
 
-    // Hard cap on the pool (matches the authoring panel's range head-room).
+    // Legacy generator clips retain their historical cap. The typed paid node
+    // has a separate, deliberately smaller wire/resource contract.
     static constexpr int kMaxParticles = 100000;
+    static constexpr int kMaxVisualParticles = 4096;
+
+    void resetSimulation (const arbitgl::GlFuncs* gl);
 
     // True iff this GL context exposes the GL 4.3 compute / SSBO entry points
     // (loadGl43Functions resolved them). The plugin gate mirrors this via
@@ -89,6 +111,7 @@ public:
 
     bool ok() const { return ok_; }
     const std::string& log() const { return log_; }
+    const ParticleDiagnostics& diagnostics() const { return diagnostics_; }
 
 private:
     bool ensurePrograms (const arbitgl::GlFuncs* gl);
@@ -122,11 +145,18 @@ private:
     int      fbPoolCount_  = -1;       // particles the fallback textures are sized for
 
     // sim uniforms
-    int sUCount_ = -1, sUSpawnTrack_ = -1, sUGravity_ = -1, sUForce_ = -1, sUDt_ = -1,
+    int sUCount_ = -1, sUSpawnTrack_ = -1, sUGravity_ = -1, sUForce_ = -1, sULifetime_ = -1, sUDt_ = -1,
         sUFrame_ = -1, sUNoteCount_ = -1, sUAspect_ = -1, sUNotes_ = -1,
         sUPosVel_ = -1, sULife_ = -1, sUStateW_ = -1;
     // draw uniforms
-    int dUPosVel_ = -1, dULife_ = -1, dUStateW_ = -1, dUPointSize_ = -1;
+    int dUPosVel_ = -1, dULife_ = -1, dUStateW_ = -1, dUPointSize_ = -1, dUColor_ = -1;
+
+  #if ARBIT_HAVE_METAL_BACKEND
+    // P6 migration slice: opt-in native Metal compute+raster output bridged
+    // through IOSurface into the existing GL compositor. The GL fallback below
+    // remains active whenever Metal is disabled or unavailable.
+    std::unique_ptr<MetalParticleEngine> metal_;
+  #endif
 #endif
 
     // Frame-gated catch-up state (export parity, audit #7) — applies to BOTH the
@@ -138,7 +168,7 @@ private:
     // reproduces the export's per-frame sequence.
     bool     simSeeded_    = false;    // has the sim run at least one playing step?
     int      lastSimFrame_ = 0;        // last integer timeline frame advanced to
-    static constexpr int kMaxCatchUp = 16;  // cap a single-call catch-up (a seek, not drift)
+    static constexpr int kMaxReplaySteps = 10000; // explicit fail-closed random-access bound
 
     // How many unit-frame advance passes to run this call; writes the uFrame the
     // FIRST pass uses (the last pass lands exactly on clock.frame, matching what
@@ -152,6 +182,7 @@ private:
     bool triedPrograms_ = false;   // compiled (or failed) once
     bool ok_ = false;
     std::string log_;
+    ParticleDiagnostics diagnostics_;
 
     unsigned computeProg_ = 0;     // particle update kernel
     unsigned drawProg_    = 0;     // point-sprite rasteriser
@@ -164,9 +195,9 @@ private:
     unsigned notesTex_    = 0;     // 4 x 128 RGBA32F (uNotes); 0 until first upload
 
     // Cached uniform locations.
-    int uCount_ = -1, uSpawnTrack_ = -1, uGravity_ = -1, uForce_ = -1;
+    int uCount_ = -1, uSpawnTrack_ = -1, uGravity_ = -1, uForce_ = -1, uLifetime_ = -1;
     int uDt_ = -1, uFrame_ = -1, uNoteCount_ = -1, uAspect_ = -1, uNotesC_ = -1;
-    int uPointSize_ = -1;
+    int uPointSize_ = -1, uColor_ = -1;
 };
 
 } // namespace videorender

@@ -41,6 +41,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "beat_timeline.h"
 
 namespace arbitgl { struct GlFuncs; }
 
@@ -109,14 +110,11 @@ struct ShaderClock
     bool   playing     = true;      // uPlaying
 };
 
-// Derive the clock from timeline display time + a constant tempo (v1: no tempo
-// map — master-plan principle 1). displaySec drives the timeline-absolute beat
-// so beat-synced shaders lock to the song regardless of where the clip sits;
-// clip-relative time/beat come from clipStartSec. Both render paths call this
-// with the same displaySec ⇒ identical uniforms ⇒ export parity.
+// Derive the clock from the authoritative project beat timeline. Both render
+// paths call this exact function, including tempo ramps and meter changes.
 ShaderClock makeShaderClock (double displaySec, double clipStartSec,
-                             double clipDurationSec, double bpm,
-                             double beatsPerBar, double fps,
+                             double clipDurationSec,
+                             const videotime::BeatTimeline& timeline, double fps,
                              bool playing, int frame);
 
 // Block B audio features (master-plan §4.2 / M4) — the master-mix analysis

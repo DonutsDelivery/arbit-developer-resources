@@ -5,8 +5,13 @@
 #include "particle_engine.h"
 #include "gl_loader.h"
 #include "shader_generator.h"   // ShaderClock, NoteFeatures
+#if defined (__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+ #include "gpu_backend/particle_engine_metal.h"
+#endif
 
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <vector>
 
 // Defensive: these GL 4.3 / point-sprite tokens come from <GL/glext.h> (pulled in
@@ -26,6 +31,8 @@
 
 namespace videorender
 {
+
+ParticleEngine::ParticleEngine() = default;
 
 // uNotes texture geometry (block_c_packer.h: 128 rows x 4 texels, RGBA32F).
 static constexpr int kNoteTexW = 4;
@@ -51,6 +58,7 @@ uniform int   uCount;
 uniform int   uSpawnTrack;
 uniform float uGravity;
 uniform float uForce;
+uniform float uLifetime;
 uniform float uDt;
 uniform int   uFrame;
 uniform int   uNoteCount;
@@ -111,7 +119,7 @@ void main()
                 float ang = (hash11(i * 31U + uint(uFrame)) - 0.5) * 2.2;  // upward spread
                 float spd = (0.25 + vel * 0.75) * uForce;
                 pt.vel  = vec2(sin(ang) * spd / max(uAspect, 1e-3), cos(ang) * spd);
-                pt.maxLife = 0.6 + hash11(i * 97U) * 1.2;
+                pt.maxLife = uLifetime > 0.0 ? uLifetime : 0.6 + hash11(i * 97U) * 1.2;
                 pt.life = 1.0;
                 pt.hue  = fract(midi / 12.0);            // hue by pitch class
             }
@@ -158,6 +166,7 @@ static const char* kDrawFragSrc = R"GLSL(
 #version 430
 in float vLife;
 in float vHue;
+uniform vec4 uColor;
 out vec4 frag;
 vec3 hsv2rgb (float h)
 {
@@ -169,8 +178,11 @@ void main()
     vec2 d = gl_PointCoord - vec2(0.5);
     float r = length(d);
     if (r > 0.5) discard;
-    float a = smoothstep(0.5, 0.0, r) * vLife;       // soft round sprite, fades with life
-    frag = vec4(hsv2rgb(vHue), a);                   // straight alpha (composites via blendNormal)
+    // smoothstep requires edge0 < edge1. Reversed edges are undefined GLSL and
+    // produced zero alpha on Apple's compilers despite working on Mesa.
+    float a = (1.0 - smoothstep(0.0, 0.5, r)) * vLife;
+    vec3 rgb = uColor.r >= 0.0 ? uColor.rgb : hsv2rgb(vHue);
+    frag = vec4(rgb, a * uColor.a);                   // straight alpha (composites via blendNormal)
 }
 )GLSL";
 
@@ -204,6 +216,7 @@ uniform int   uCount;
 uniform int   uSpawnTrack;
 uniform float uGravity;
 uniform float uForce;
+uniform float uLifetime;
 uniform float uDt;
 uniform int   uFrame;
 uniform int   uNoteCount;
@@ -273,7 +286,7 @@ void main()
                 float ang = (hash11(i * 31U + uint(uFrame)) - 0.5) * 2.2;  // upward spread
                 float spd = (0.25 + v * 0.75) * uForce;
                 vel  = vec2(sin(ang) * spd / max(uAspect, 1e-3), cos(ang) * spd);
-                maxLife = 0.6 + hash11(i * 97U) * 1.2;
+                maxLife = uLifetime > 0.0 ? uLifetime : 0.6 + hash11(i * 97U) * 1.2;
                 life = 1.0;
                 hue  = fract(midi / 12.0);                // hue by pitch class
             }
@@ -325,6 +338,7 @@ static const char* kFbDrawFragSrc = R"GLSL(
 #version 410 core
 in float vLife;
 in float vHue;
+uniform vec4 uColor;
 out vec4 frag;
 vec3 hsv2rgb (float h)
 {
@@ -336,8 +350,9 @@ void main()
     vec2 d = gl_PointCoord - vec2(0.5);
     float r = length(d);
     if (r > 0.5) discard;
-    float a = smoothstep(0.5, 0.0, r) * vLife;
-    frag = vec4(hsv2rgb(vHue), a);
+    float a = (1.0 - smoothstep(0.0, 0.5, r)) * vLife;
+    vec3 rgb = uColor.r >= 0.0 ? uColor.rgb : hsv2rgb(vHue);
+    frag = vec4(rgb, a * uColor.a);
 }
 )GLSL";
 
@@ -454,12 +469,14 @@ bool ParticleEngine::ensurePrograms (const arbitgl::GlFuncs* gl)
     uSpawnTrack_ = gl->GetUniformLocation (computeProg_, "uSpawnTrack");
     uGravity_    = gl->GetUniformLocation (computeProg_, "uGravity");
     uForce_      = gl->GetUniformLocation (computeProg_, "uForce");
+    uLifetime_   = gl->GetUniformLocation (computeProg_, "uLifetime");
     uDt_         = gl->GetUniformLocation (computeProg_, "uDt");
     uFrame_      = gl->GetUniformLocation (computeProg_, "uFrame");
     uNoteCount_  = gl->GetUniformLocation (computeProg_, "uNoteCount");
     uAspect_     = gl->GetUniformLocation (computeProg_, "uAspect");
     uNotesC_     = gl->GetUniformLocation (computeProg_, "uNotes");
     uPointSize_  = gl->GetUniformLocation (drawProg_, "uPointSize");
+    uColor_      = gl->GetUniformLocation (drawProg_, "uColor");
 
     if (vao_ == 0) gl->GenVertexArrays (1, &vao_);
     ok_ = true;
@@ -525,18 +542,32 @@ void ParticleEngine::uploadNotes (const arbitgl::GlFuncs* gl, const NoteFeatures
     }
 }
 
+void ParticleEngine::resetSimulation (const arbitgl::GlFuncs* gl)
+{
+    // Reuse the established complete teardown path. This is uncommon (seek or
+    // structural revision) and guarantees all GL/Metal/fallback pools restart
+    // from their documented zero/dead state rather than partially rewinding.
+    shutdown(gl);
+}
+
 int ParticleEngine::planSimSteps (const ShaderClock& clock, int& firstFrame)
 {
-    if (! clock.playing) { firstFrame = clock.frame; return 1; }
+    if (! clock.playing) { firstFrame = clock.frame; return 0; }
     int steps;
-    if (! simSeeded_)                      { steps = 1; firstFrame = clock.frame; }
+    if (! simSeeded_)
+    {
+        if (clock.frame < 0 || clock.frame >= kMaxReplaySteps) return -1;
+        steps = clock.frame + 1;
+        firstFrame = 0;
+    }
     else if (clock.frame == lastSimFrame_) { steps = 0; firstFrame = clock.frame; }
-    else if (clock.frame <  lastSimFrame_) { steps = 1; firstFrame = clock.frame; }
+    else if (clock.frame <  lastSimFrame_) { return -1; }
     else
     {
         const int d = clock.frame - lastSimFrame_;
-        steps = d < kMaxCatchUp ? d : kMaxCatchUp;
-        firstFrame = clock.frame - steps + 1;
+        if (d > kMaxReplaySteps) return -1;
+        steps = d;
+        firstFrame = lastSimFrame_ + 1;
     }
     simSeeded_ = true;
     lastSimFrame_ = clock.frame;
@@ -547,15 +578,94 @@ unsigned ParticleEngine::render (const arbitgl::GlFuncs* gl, const ShaderClock& 
                                  int width, int height, const ParticleParams& params,
                                  const NoteFeatures* notes)
 {
+    // Renderer boundary: unlike older generator code, particles restore every GL
+    // state they mutate. This lets callers compose or fail without hidden state
+    // coupling; owned object contents are the only persistent side effect.
+    struct StateBoundary
+    {
+        const arbitgl::GlFuncs* gl;
+        GLint program = 0, activeTexture = 0, drawFbo = 0, readFbo = 0, vao = 0, ssbo = 0;
+        GLint viewport[4] {}, texture2d[3] {}, blendSrcRgb = 0, blendDstRgb = 0;
+        GLint blendSrcAlpha = 0, blendDstAlpha = 0, drawBuffer = 0, readBuffer = 0;
+        GLfloat clear[4] {};
+        GLboolean blend = GL_FALSE, pointSize = GL_FALSE;
+        explicit StateBoundary (const arbitgl::GlFuncs* funcs) : gl(funcs)
+        {
+            glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+            glGetIntegerv(GL_ACTIVE_TEXTURE, &activeTexture);
+            glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFbo);
+            glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFbo);
+            glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao);
+            glGetIntegerv(GL_VIEWPORT, viewport);
+            glGetIntegerv(GL_BLEND_SRC_RGB, &blendSrcRgb);
+            glGetIntegerv(GL_BLEND_DST_RGB, &blendDstRgb);
+            glGetIntegerv(GL_BLEND_SRC_ALPHA, &blendSrcAlpha);
+            glGetIntegerv(GL_BLEND_DST_ALPHA, &blendDstAlpha);
+            glGetIntegerv(GL_DRAW_BUFFER0, &drawBuffer);
+            glGetIntegerv(GL_READ_BUFFER, &readBuffer);
+            glGetFloatv(GL_COLOR_CLEAR_VALUE, clear);
+            blend = glIsEnabled(GL_BLEND); pointSize = glIsEnabled(GL_PROGRAM_POINT_SIZE);
+            for (int unit = 0; unit < 3; ++unit)
+            {
+                gl->ActiveTexture(GL_TEXTURE0 + unit);
+                glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture2d[unit]);
+            }
+#if !defined (__APPLE__)
+            gl->GetIntegeri_v(GL_SHADER_STORAGE_BUFFER_BINDING, 0, &ssbo);
+#endif
+        }
+        ~StateBoundary()
+        {
+#if !defined (__APPLE__)
+            gl->BindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, (GLuint) ssbo);
+#endif
+            for (int unit = 0; unit < 3; ++unit)
+            {
+                gl->ActiveTexture(GL_TEXTURE0 + unit);
+                glBindTexture(GL_TEXTURE_2D, (GLuint) texture2d[unit]);
+            }
+            gl->ActiveTexture((GLenum) activeTexture);
+            gl->BindVertexArray((GLuint) vao);
+            gl->UseProgram((GLuint) program);
+            gl->BindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint) drawFbo);
+            gl->BindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint) readFbo);
+            glDrawBuffer((GLenum) drawBuffer);
+            glReadBuffer((GLenum) readBuffer);
+            glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+            gl->BlendFuncSeparate((GLenum) blendSrcRgb, (GLenum) blendDstRgb,
+                                  (GLenum) blendSrcAlpha, (GLenum) blendDstAlpha);
+            glClearColor(clear[0], clear[1], clear[2], clear[3]);
+            blend ? glEnable(GL_BLEND) : glDisable(GL_BLEND);
+            pointSize ? glEnable(GL_PROGRAM_POINT_SIZE) : glDisable(GL_PROGRAM_POINT_SIZE);
+        }
+    } boundary(gl);
     if (! computeAvailable (gl)) return 0;
     if (width <= 0 || height <= 0) return 0;
+    if (simSeeded_ && clock.frame < lastSimFrame_)
+        resetSimulation(gl);
 
     int count = params.count;
     if (count < 1) count = 1;
     if (count > kMaxParticles) count = kMaxParticles;
 
 #if defined (__APPLE__)
-    // macOS (GL 4.1): no compute/SSBO — run the ping-pong-FBO fragment fallback.
+  #if ARBIT_HAVE_METAL_BACKEND
+    if (MetalParticleEngine::enabled())
+    {
+        if (metal_ == nullptr)
+            metal_ = std::make_unique<MetalParticleEngine>();
+        if (const unsigned texture = metal_->render (gl, clock, width, height,
+                                                      params, notes))
+        {
+            diagnostics_ = metal_->diagnostics();
+            ok_ = true;
+            log_ = "metal";
+            return texture;
+        }
+        log_ = metal_->log();
+    }
+  #endif
+    // macOS GL 4.1 fallback: ping-pong fragment/MRT simulation.
     return renderFallback (gl, clock, width, height, params, notes, count);
 #else
     if (! ensurePrograms (gl)) return 0;
@@ -572,11 +682,13 @@ unsigned ParticleEngine::render (const arbitgl::GlFuncs* gl, const ShaderClock& 
     //    double-step the sim vs the export (which runs one pass per frame).
     int firstFrame = clock.frame;
     const int simSteps = planSimSteps (clock, firstFrame);
+    if (simSteps < 0) { log_ = "particle replay exceeds deterministic bound"; return 0; }
     gl->UseProgram (computeProg_);
     gl->Uniform1i (uCount_, count);
     gl->Uniform1i (uSpawnTrack_, params.spawnTrack);
     gl->Uniform1f (uGravity_, params.gravity);
     gl->Uniform1f (uForce_, params.force > 0.0f ? params.force : 0.0f);
+    gl->Uniform1f (uLifetime_, params.lifetime);
     gl->Uniform1f (uDt_, clock.playing ? (float) clock.timeDelta : 0.0f);
     gl->Uniform1i (uNoteCount_, noteCount);
     gl->Uniform1f (uAspect_, height > 0 ? (float) width / (float) height : 1.0f);
@@ -587,7 +699,7 @@ unsigned ParticleEngine::render (const arbitgl::GlFuncs* gl, const ShaderClock& 
     gl->BindBufferBase (GL_SHADER_STORAGE_BUFFER, 0, ssbo_);
     for (int s = 0; s < simSteps; ++s)   // simSteps==0 ⇒ hold the pool, rasterise as-is
     {
-        gl->Uniform1i (uFrame_, firstFrame + s);
+        gl->Uniform1i (uFrame_, firstFrame + s + params.seed);
         gl->DispatchCompute ((unsigned) ((count + 255) / 256), 1, 1);
         gl->MemoryBarrier (GL_SHADER_STORAGE_BARRIER_BIT);
     }
@@ -603,6 +715,7 @@ unsigned ParticleEngine::render (const arbitgl::GlFuncs* gl, const ShaderClock& 
     glEnable (GL_PROGRAM_POINT_SIZE);
     gl->UseProgram (drawProg_);
     gl->Uniform1f (uPointSize_, params.size > 0.0f ? params.size : 1.0f);
+    gl->Uniform4f (uColor_, params.red, params.green, params.blue, params.alpha);
 #if !defined (__APPLE__)
     gl->BindBufferBase (GL_SHADER_STORAGE_BUFFER, 0, ssbo_);
 #endif
@@ -634,6 +747,7 @@ bool ParticleEngine::ensureFallback (const arbitgl::GlFuncs* gl, int count)
         sUSpawnTrack_ = gl->GetUniformLocation (simProg_, "uSpawnTrack");
         sUGravity_    = gl->GetUniformLocation (simProg_, "uGravity");
         sUForce_      = gl->GetUniformLocation (simProg_, "uForce");
+        sULifetime_   = gl->GetUniformLocation (simProg_, "uLifetime");
         sUDt_         = gl->GetUniformLocation (simProg_, "uDt");
         sUFrame_      = gl->GetUniformLocation (simProg_, "uFrame");
         sUNoteCount_  = gl->GetUniformLocation (simProg_, "uNoteCount");
@@ -645,7 +759,8 @@ bool ParticleEngine::ensureFallback (const arbitgl::GlFuncs* gl, int count)
         dUPosVel_     = gl->GetUniformLocation (drawFbProg_, "uPosVel");
         dULife_       = gl->GetUniformLocation (drawFbProg_, "uLife");
         dUStateW_     = gl->GetUniformLocation (drawFbProg_, "uStateW");
-        dUPointSize_  = gl->GetUniformLocation (drawFbProg_, "uPointSize");
+        dUPointSize_ = gl->GetUniformLocation (drawFbProg_, "uPointSize");
+        dUColor_     = gl->GetUniformLocation (drawFbProg_, "uColor");
 
         if (vao_ == 0) gl->GenVertexArrays (1, &vao_);
         ok_ = true;
@@ -716,6 +831,8 @@ unsigned ParticleEngine::renderFallback (const arbitgl::GlFuncs* gl, const Shade
 
     const int noteCount =
         (notes != nullptr && ! notes->notesTex.empty()) ? notes->noteCount : 0;
+    diagnostics_ = {};
+    diagnostics_.noteRows = noteCount;
 
     // 1) Advance the pool — frame-gated catch-up (audit #7), mirroring the
     //    compute path: one fullscreen sim pass per integer timeline frame crossed
@@ -729,6 +846,7 @@ unsigned ParticleEngine::renderFallback (const arbitgl::GlFuncs* gl, const Shade
     gl->Uniform1i (sUSpawnTrack_, params.spawnTrack);
     gl->Uniform1f (sUGravity_, params.gravity);
     gl->Uniform1f (sUForce_, params.force > 0.0f ? params.force : 0.0f);
+    gl->Uniform1f (sULifetime_, params.lifetime);
     gl->Uniform1f (sUDt_, clock.playing ? (float) clock.timeDelta : 0.0f);
     gl->Uniform1i (sUNoteCount_, noteCount);
     gl->Uniform1f (sUAspect_, height > 0 ? (float) width / (float) height : 1.0f);
@@ -744,7 +862,7 @@ unsigned ParticleEngine::renderFallback (const arbitgl::GlFuncs* gl, const Shade
     for (int s = 0; s < simSteps; ++s)
     {
         const int writeIdx = 1 - fbRead_;
-        gl->Uniform1i (sUFrame_, firstFrame + s);
+        gl->Uniform1i (sUFrame_, firstFrame + s + params.seed);
         gl->ActiveTexture (GL_TEXTURE1);
         glBindTexture (GL_TEXTURE_2D, posVelTex_[fbRead_]);
         gl->ActiveTexture (GL_TEXTURE2);
@@ -754,6 +872,32 @@ unsigned ParticleEngine::renderFallback (const arbitgl::GlFuncs* gl, const Shade
         glViewport (0, 0, stateTexW_, stateTexH_);
         glDrawArrays (GL_TRIANGLES, 0, 3);
         fbRead_ = writeIdx;          // just-written set becomes current
+    }
+
+    const char* diagnostic = std::getenv ("ARBIT_PARTICLE_DIAGNOSTICS");
+    if (diagnostic != nullptr && std::strcmp (diagnostic, "1") == 0)
+    {
+        std::vector<float> life ((size_t) stateTexW_ * (size_t) stateTexH_ * 4);
+        std::vector<float> posVel ((size_t) stateTexW_ * (size_t) stateTexH_ * 4);
+        gl->BindFramebuffer (GL_READ_FRAMEBUFFER, simFbo_[fbRead_]);
+        glReadBuffer (GL_COLOR_ATTACHMENT1);
+        glReadPixels (0, 0, stateTexW_, stateTexH_, GL_RGBA, GL_FLOAT, life.data());
+        glReadBuffer (GL_COLOR_ATTACHMENT0);
+        glReadPixels (0, 0, stateTexW_, stateTexH_, GL_RGBA, GL_FLOAT, posVel.data());
+        diagnostics_.liveParticles = 0;
+        diagnostics_.visibleCandidates = 0;
+        for (int i = 0; i < count; ++i)
+        {
+            const auto base = (size_t) i * 4;
+            if (life[base] > 0.0f)
+            {
+                ++diagnostics_.liveParticles;
+                if (std::isfinite (posVel[base]) && std::isfinite (posVel[base + 1])
+                    && posVel[base] >= 0.0f && posVel[base] <= 1.0f
+                    && posVel[base + 1] >= 0.0f && posVel[base + 1] <= 1.0f)
+                    ++diagnostics_.visibleCandidates;
+            }
+        }
     }
 
     // 2) Rasterise as point sprites into the layer texture (outTex_/fbo_).
@@ -768,6 +912,7 @@ unsigned ParticleEngine::renderFallback (const arbitgl::GlFuncs* gl, const Shade
     glEnable (GL_PROGRAM_POINT_SIZE);
     gl->UseProgram (drawFbProg_);
     gl->Uniform1f (dUPointSize_, params.size > 0.0f ? params.size : 1.0f);
+    gl->Uniform4f (dUColor_, params.red, params.green, params.blue, params.alpha);
     gl->Uniform1i (dUStateW_, stateTexW_);
     gl->ActiveTexture (GL_TEXTURE0);
     glBindTexture (GL_TEXTURE_2D, posVelTex_[fbRead_]);   // fbRead_ = latest after catch-up
@@ -780,8 +925,21 @@ unsigned ParticleEngine::renderFallback (const arbitgl::GlFuncs* gl, const Shade
     gl->BindVertexArray (0);
     glDisable (GL_PROGRAM_POINT_SIZE);
     glDisable (GL_BLEND);
+    if (diagnostic != nullptr && std::strcmp (diagnostic, "1") == 0)
+    {
+        std::vector<unsigned char> pixels ((size_t) width * (size_t) height * 4);
+        gl->BindFramebuffer (GL_READ_FRAMEBUFFER, fbo_);
+        glReadBuffer (GL_COLOR_ATTACHMENT0);
+        glReadPixels (0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+        diagnostics_.drawAlphaPixels = 0;
+        for (size_t i = 3; i < pixels.size(); i += 4)
+            if (pixels[i] != 0) ++diagnostics_.drawAlphaPixels;
+        diagnostics_.readbackAlphaPixels = diagnostics_.drawAlphaPixels;
+    }
     // fbRead_ already points at the just-written set (advanced inside the loop).
     // Caller restores its own FBO + viewport (matches ShaderGenerator::render).
+    ok_ = true;
+    log_ = "opengl-fragment";
     return outTex_;
 }
 #endif // __APPLE__
@@ -797,6 +955,13 @@ void ParticleEngine::shutdown (const arbitgl::GlFuncs* gl)
     if (outTex_)      { glDeleteTextures (1, &outTex_);   outTex_ = 0; }
     if (notesTex_)    { glDeleteTextures (1, &notesTex_); notesTex_ = 0; }
 #if defined (__APPLE__)
+  #if ARBIT_HAVE_METAL_BACKEND
+    if (metal_ != nullptr)
+    {
+        metal_->shutdown (gl);
+        metal_.reset();
+    }
+  #endif
     if (simProg_)    { gl->DeleteProgram (simProg_);    simProg_ = 0; }
     if (drawFbProg_) { gl->DeleteProgram (drawFbProg_); drawFbProg_ = 0; }
     for (int s = 0; s < 2; ++s)
@@ -810,6 +975,7 @@ void ParticleEngine::shutdown (const arbitgl::GlFuncs* gl)
     poolCount_ = 0; outW_ = outH_ = 0;
     triedPrograms_ = false; ok_ = false;
     simSeeded_ = false; lastSimFrame_ = 0;   // restart the frame-gated catch-up clean
+    diagnostics_ = {};
 }
 
 ParticleEngine::~ParticleEngine()

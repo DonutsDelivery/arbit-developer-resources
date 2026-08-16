@@ -7,6 +7,7 @@
 #include "renderer.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -39,12 +40,18 @@ layout (location = 1) in vec2 aTexCoord;
 
 uniform mat4 uTransform;
 uniform vec4 uCrop;  // left, right, top, bottom
+uniform int uCornerPin;
+uniform vec2 uCorners[4];
 
 out vec2 TexCoord;
 out vec2 RawUV;      // un-cropped quad UV (Arbit extension: shape mask space)
 
 void main() {
-    gl_Position = uTransform * vec4(aPos, 0.0, 1.0);
+    vec4 affinePosition = uTransform * vec4(aPos, 0.0, 1.0);
+    vec2 top = mix(uCorners[0], uCorners[1], aTexCoord.x);
+    vec2 bottom = mix(uCorners[3], uCorners[2], aTexCoord.x);
+    gl_Position = uCornerPin != 0 ? vec4(mix(top, bottom, aTexCoord.y), 0.0, 1.0)
+                                  : affinePosition;
 
     // Apply crop by remapping texture coordinates
     vec2 cropMin = vec2(uCrop.x, uCrop.z);
@@ -71,6 +78,57 @@ uniform int uMaskType;       // 0 none, 1 rect, 2 ellipse
 uniform vec4 uMaskRect;      // cx, cy, w, h (full extents)
 uniform float uMaskFeather;  // feather width in mask UV units
 uniform int uMaskInvert;
+uniform sampler2D uMatteTexture;
+uniform sampler2D uMatteTextureB;
+uniform int uMatteCombineMode;
+uniform int uMatteApply;
+uniform vec2 uMatteTexel;
+uniform vec4 uMatteRefine; // black, white, erode/dilate px, feather px
+uniform float uMatteChoke;
+uniform int uMatteInvert;
+uniform sampler2D uDepthTexture;
+uniform int uDepthFog;
+uniform vec3 uFogRangeDensity;
+uniform vec4 uFogColor;
+
+float rawMatteCoverage(vec2 uv) {
+    float value = texture(uMatteTexture, uv).r;
+    if (uMatteCombineMode >= 0) {
+        float b = texture(uMatteTextureB, uv).r;
+        if (uMatteCombineMode == 0) value = max(value, b);
+        else if (uMatteCombineMode == 1) value = min(value, b);
+        else if (uMatteCombineMode == 2) value = max(value - b, 0.0);
+        else value = abs(value - b);
+    }
+    return value;
+}
+float matteCoverage(vec2 uv) {
+    if (uMatteApply == 0) return 1.0;
+    int radius = int(clamp(abs(uMatteRefine.z), 0.0, 4.0));
+    float value = rawMatteCoverage(uv);
+    if (radius > 0) {
+        float aggregate = uMatteRefine.z >= 0.0 ? 0.0 : 1.0;
+        for (int y = -4; y <= 4; ++y) for (int x = -4; x <= 4; ++x)
+            if (abs(x) <= radius && abs(y) <= radius) {
+                float sampleValue = rawMatteCoverage(uv + vec2(x,y) * uMatteTexel);
+                aggregate = uMatteRefine.z >= 0.0 ? max(aggregate, sampleValue)
+                                                  : min(aggregate, sampleValue);
+            }
+        value = aggregate;
+    }
+    int feather = int(clamp(uMatteRefine.w, 0.0, 4.0));
+    if (feather > 0) {
+        float sum = 0.0, count = 0.0;
+        for (int y = -4; y <= 4; ++y) for (int x = -4; x <= 4; ++x)
+            if (abs(x) <= feather && abs(y) <= feather) {
+                sum += rawMatteCoverage(uv + vec2(x,y) * uMatteTexel); count += 1.0;
+            }
+        value = sum / max(count, 1.0);
+    }
+    value = clamp((value - uMatteRefine.x) / max(uMatteRefine.y - uMatteRefine.x, 1e-5), 0.0, 1.0);
+    value = clamp(value + uMatteChoke, 0.0, 1.0);
+    return uMatteInvert != 0 ? 1.0 - value : value;
+}
 
 float maskCoverage(vec2 uv) {
     if (uMaskType == 0) return 1.0;
@@ -93,8 +151,61 @@ float maskCoverage(vec2 uv) {
 }
 
 void main() {
-    vec4 texColor = texture(uTexture, TexCoord);
-    FragColor = vec4(texColor.rgb, texColor.a * uOpacity * maskCoverage(RawUV));
+    float depth = texture(uDepthTexture, RawUV).r;
+    vec2 sampleUV = TexCoord;
+    if (uDepthFog == 3)
+        sampleUV = clamp(TexCoord + vec2(uFogRangeDensity.x, uFogRangeDensity.y)
+            * (depth - uFogRangeDensity.z), vec2(0.0), vec2(1.0));
+    vec4 texColor = texture(uTexture, sampleUV);
+    if (uDepthFog == 2) {
+        float blur = clamp(abs(depth - uFogRangeDensity.y) / max(uFogRangeDensity.z, 1e-5), 0.0, 1.0)
+            * uFogRangeDensity.x;
+        vec2 stepUV = blur / vec2(textureSize(uTexture, 0));
+        texColor = (texColor * 4.0 + texture(uTexture, sampleUV + vec2(stepUV.x, 0.0))
+            + texture(uTexture, sampleUV - vec2(stepUV.x, 0.0))
+            + texture(uTexture, sampleUV + vec2(0.0, stepUV.y))
+            + texture(uTexture, sampleUV - vec2(0.0, stepUV.y))) / 8.0;
+    }
+    vec3 rgb = texColor.rgb;
+    if (uDepthFog == 1) {
+        float range = clamp((depth - uFogRangeDensity.x) /
+                            max(uFogRangeDensity.y - uFogRangeDensity.x, 1e-5), 0.0, 1.0);
+        float amount = uFogColor.a * (1.0 - exp(-uFogRangeDensity.z * range));
+        rgb = mix(rgb, uFogColor.rgb, amount);
+    } else if (uDepthFog == 4) {
+        rgb *= uFogColor.rgb * max(0.0, uFogRangeDensity.y
+            + uFogRangeDensity.x * (1.0 - depth));
+    }
+    FragColor = vec4(rgb, texColor.a * uOpacity * maskCoverage(RawUV) * matteCoverage(RawUV));
+}
+)GLSL";
+
+// Draw Shape image producer. Geometry is expressed in normalized frame UVs,
+// matching the native Metal compositor exactly; a negative width is the private
+// rectangle/ellipse discriminator and all colour channels remain straight RGBA.
+const char* kDrawShapeFragment = R"GLSL(#version 330 core
+in vec2 RawUV;
+out vec4 FragColor;
+
+uniform vec4 uShapeRect;   // cx, cy, signed width (ellipse < 0), height
+uniform vec4 uShapeColor;
+
+void main() {
+    vec2 halfSize = max(abs(uShapeRect.zw) * 0.5, vec2(0.0));
+    vec2 local = abs(RawUV - uShapeRect.xy);
+    bool inside;
+    if (uShapeRect.z < 0.0) {
+        if (any(lessThanEqual(halfSize, vec2(0.0))))
+            inside = false;
+        else {
+            vec2 normalized = local / halfSize;
+            inside = dot(normalized, normalized) <= 1.0;
+        }
+    } else {
+        vec2 d = local - halfSize;
+        inside = max(d.x, d.y) <= 0.0;
+    }
+    FragColor = inside ? uShapeColor : vec4(0.0);
 }
 )GLSL";
 
@@ -467,6 +578,40 @@ in vec2 TexCoord;
 out vec4 FragColor;
 uniform sampler2D uTexture;
 void main() { FragColor = texture(uTexture, TexCoord); }
+)GLSL";
+
+const char* kNodePreviewFragment = R"GLSL(#version 330 core
+in vec2 TexCoord;
+out vec4 FragColor;
+uniform sampler2D uFinal;
+uniform sampler2D uPreview;
+uniform int uLayout;
+uniform int uBackground;
+uniform float uZoom;
+uniform vec2 uPan;
+uniform float uSplit;
+vec3 bg(vec2 uv) {
+    if (uBackground == 1) return vec3(0.0);
+    if (uBackground == 2) return vec3(1.0);
+    float c = mod(floor(uv.x * 32.0) + floor(uv.y * 32.0), 2.0);
+    return mix(vec3(0.18), vec3(0.32), c);
+}
+void main() {
+    if (uLayout == 1 && TexCoord.x < uSplit) {
+        FragColor = texture(uFinal, vec2(TexCoord.x / uSplit, TexCoord.y)); return;
+    }
+    vec4 overlayRect = vec4(0.58, 0.04, 0.98, 0.44);
+    if (uLayout == 2 && (TexCoord.x < overlayRect.x || TexCoord.x > overlayRect.z
+                      || TexCoord.y < overlayRect.y || TexCoord.y > overlayRect.w)) {
+        FragColor = texture(uFinal, TexCoord); return;
+    }
+    vec2 r = uLayout == 1 ? vec2((TexCoord.x-uSplit)/(1.0-uSplit), TexCoord.y)
+                          : (TexCoord-overlayRect.xy)/(overlayRect.zw-overlayRect.xy);
+    vec2 uv = (r-vec2(0.5))/uZoom + vec2(0.5)-uPan;
+    vec4 p = (uv.x>=0.0 && uv.x<=1.0 && uv.y>=0.0 && uv.y<=1.0)
+        ? texture(uPreview, uv) : vec4(0.0);
+    FragColor = vec4(mix(bg(r), p.rgb, p.a), 1.0);
+}
 )GLSL";
 
 // Canvas frame pass — Arbit extension (PROTOCOL.md §Project canvas & view
@@ -960,18 +1105,44 @@ inline int geomIndexForType (int type)
 } // namespace
 
 bool FrameRenderer::initialize (const arbitgl::GlFuncs* gl, int outWidth, int outHeight,
-                                std::string& error)
+                                std::string& error, bool metalOnly)
 {
     static_assert (sizeof (kGeomEffects) / sizeof (kGeomEffects[0]) == kGeomEffectCount,
                    "kGeomEffects table size must equal kGeomEffectCount (sizes geom_[])");
     gl_ = gl;
-    if (gl_ == nullptr)
+    metalOnly_ = metalOnly;
+    if (gl_ == nullptr && ! metalOnly_)
     {
         error = "null GL function table";
         return false;
     }
 
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    if (metalOnly_)
+    {
+        outW_ = std::max (outWidth, 1);
+        outH_ = std::max (outHeight, 1);
+        metalRenderer_ = std::make_unique<MetalFrameRenderer>();
+        if (! metalRenderer_->initialize (gl_, outW_, outH_, error, true))
+        {
+            metalRenderer_.reset();
+            gl_ = nullptr;
+            return false;
+        }
+        error.clear();
+        return true;
+    }
+#else
+    if (metalOnly_)
+    {
+        error = "Metal-only renderer requested without Metal support";
+        gl_ = nullptr;
+        return false;
+    }
+#endif
+
     if ((layer_.prog = compileProgram (kVertexShader, kLayerFragment, "layer", error)) == 0
+        || (drawShape_.prog = compileProgram (kVertexShader, kDrawShapeFragment, "drawShape", error)) == 0
         || (blend_.prog = compileProgram (kVertexShader, kBlendFragment, "blend", error)) == 0
         || (trans_.prog = compileProgram (kVertexShader, kTransitionFragment, "transition", error)) == 0
         || (fx_.prog = compileProgram (kVertexShader, kEffectsFragment, "effects", error)) == 0
@@ -979,6 +1150,7 @@ bool FrameRenderer::initialize (const arbitgl::GlFuncs* gl, int outWidth, int ou
         || (sharpen_.prog = compileProgram (kVertexShader, kSharpenFragment, "sharpen", error)) == 0
         || (lut_.prog = compileProgram (kVertexShader, kLutFragment, "lut", error)) == 0
         || (blit_.prog = compileProgram (kBlitVertex, kBlitFragment, "blit", error)) == 0
+        || (preview_.prog = compileProgram (kVertexShader, kNodePreviewFragment, "nodePreview", error)) == 0
         || (canvas_.prog = compileProgram (kVertexShader, kCanvasFrameFragment, "canvasFrame", error)) == 0
         || (bloomThresh_.prog = compileProgram (kVertexShader, kBloomThreshFragment, "bloomThresh", error)) == 0
         || (bloomCombine_.prog = compileProgram (kVertexShader, kBloomCombineFragment, "bloomCombine", error)) == 0)
@@ -1012,6 +1184,8 @@ bool FrameRenderer::initialize (const arbitgl::GlFuncs* gl, int outWidth, int ou
     auto loc = [&] (unsigned prog, const char* n) { return gl_->GetUniformLocation (prog, n); };
     layer_.uTransform = loc (layer_.prog, "uTransform");
     layer_.uCrop      = loc (layer_.prog, "uCrop");
+    layer_.uCornerPin = loc (layer_.prog, "uCornerPin");
+    layer_.uCorners   = loc (layer_.prog, "uCorners");
     layer_.uTexture   = loc (layer_.prog, "uTexture");
     layer_.uOpacity   = loc (layer_.prog, "uOpacity");
     layer_.uBlendMode = loc (layer_.prog, "uBlendMode");
@@ -1019,6 +1193,23 @@ bool FrameRenderer::initialize (const arbitgl::GlFuncs* gl, int outWidth, int ou
     layer_.uMaskRect    = loc (layer_.prog, "uMaskRect");
     layer_.uMaskFeather = loc (layer_.prog, "uMaskFeather");
     layer_.uMaskInvert  = loc (layer_.prog, "uMaskInvert");
+    layer_.uMatteTexture = loc (layer_.prog, "uMatteTexture");
+    layer_.uMatteTextureB = loc (layer_.prog, "uMatteTextureB");
+    layer_.uMatteCombineMode = loc (layer_.prog, "uMatteCombineMode");
+    layer_.uMatteApply = loc (layer_.prog, "uMatteApply");
+    layer_.uMatteTexel = loc (layer_.prog, "uMatteTexel");
+    layer_.uMatteRefine = loc (layer_.prog, "uMatteRefine");
+    layer_.uMatteChoke = loc (layer_.prog, "uMatteChoke");
+    layer_.uMatteInvert = loc (layer_.prog, "uMatteInvert");
+    layer_.uDepthTexture = loc (layer_.prog, "uDepthTexture");
+    layer_.uDepthFog = loc (layer_.prog, "uDepthFog");
+    layer_.uFogRangeDensity = loc (layer_.prog, "uFogRangeDensity");
+    layer_.uFogColor = loc (layer_.prog, "uFogColor");
+
+    drawShape_.uTransform = loc (drawShape_.prog, "uTransform");
+    drawShape_.uCrop      = loc (drawShape_.prog, "uCrop");
+    drawShape_.uRect      = loc (drawShape_.prog, "uShapeRect");
+    drawShape_.uColor     = loc (drawShape_.prog, "uShapeColor");
 
     blend_.uTransform = loc (blend_.prog, "uTransform");
     blend_.uCrop      = loc (blend_.prog, "uCrop");
@@ -1067,6 +1258,13 @@ bool FrameRenderer::initialize (const arbitgl::GlFuncs* gl, int outWidth, int ou
     lut_.uLutSize   = loc (lut_.prog, "uLutSize");
 
     blit_.uTexture = loc (blit_.prog, "uTexture");
+    preview_.uFinal = loc (preview_.prog, "uFinal");
+    preview_.uPreview = loc (preview_.prog, "uPreview");
+    preview_.uLayout = loc (preview_.prog, "uLayout");
+    preview_.uBackground = loc (preview_.prog, "uBackground");
+    preview_.uZoom = loc (preview_.prog, "uZoom");
+    preview_.uPan = loc (preview_.prog, "uPan");
+    preview_.uSplit = loc (preview_.prog, "uSplit");
 
     canvas_.uTransform  = loc (canvas_.prog, "uTransform");
     canvas_.uCrop       = loc (canvas_.prog, "uCrop");
@@ -1173,10 +1371,12 @@ unsigned FrameRenderer::createOutputTexture() const
 
 void FrameRenderer::releaseTargets()
 {
-    GLuint texs[6] = { accumTex_[0], accumTex_[1], layerTexA_, layerTexB_,
-                       fxTex_[0], fxTex_[1] };
-    glDeleteTextures (6, texs);
+    GLuint texs[7] = { accumTex_[0], accumTex_[1], layerTexA_, layerTexB_,
+                       fxTex_[0], fxTex_[1], transformInspectionTex_ };
+    glDeleteTextures (7, texs);
     accumTex_[0] = accumTex_[1] = layerTexA_ = layerTexB_ = fxTex_[0] = fxTex_[1] = 0;
+    transformInspectionTex_ = 0;
+    transformInspectionReady_ = false;
     if (hashPbo_[0] != 0 || hashPbo_[1] != 0)
     {
         gl_->DeleteBuffers (2, hashPbo_);
@@ -1230,6 +1430,16 @@ void FrameRenderer::setOutputSize (int outWidth, int outHeight)
 {
     outWidth = std::max (outWidth, 1);
     outHeight = std::max (outHeight, 1);
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    if (metalOnly_)
+    {
+        outW_ = outWidth;
+        outH_ = outHeight;
+        if (metalRenderer_ != nullptr)
+            metalRenderer_->setOutputSize (gl_, outW_, outH_);
+        return;
+    }
+#endif
     if (gl_ == nullptr || (outWidth == outW_ && outHeight == outH_ && accumTex_[0] != 0))
         return;
 
@@ -1258,16 +1468,28 @@ void FrameRenderer::setOutputSize (int outWidth, int outHeight)
     gl_->BindBuffer (GL_PIXEL_PACK_BUFFER, 0);
     hashPending_[0] = hashPending_[1] = false;
     hashIdx_ = 0;
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    if (metalRenderer_ != nullptr)
+        metalRenderer_->setOutputSize (gl_, outW_, outH_);
+#endif
 }
 
 void FrameRenderer::setCanvas (int width, int height)
 {
     canvasW_ = width;
     canvasH_ = height;
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    if (metalRenderer_ != nullptr)
+        metalRenderer_->setCanvas (width, height);
+#endif
 }
 
 void FrameRenderer::setPresentSize (int width, int height)
 {
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    if (metalRenderer_ != nullptr)
+        metalRenderer_->setPresentSize (width, height);
+#endif
     if (gl_ == nullptr)
         return;
     if (width <= 0 || height <= 0)   // disable: applyCanvasFrame reverts to composite size
@@ -1297,6 +1519,10 @@ void FrameRenderer::setView (float zoom, float panX, float panY)
     viewZoom_ = std::clamp (zoom, 0.02f, 32.0f);
     viewPanX_ = panX;
     viewPanY_ = panY;
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    if (metalRenderer_ != nullptr)
+        metalRenderer_->setView (viewZoom_, viewPanX_, viewPanY_);
+#endif
 }
 
 void FrameRenderer::viewMap (float& zx, float& zy, float& cx, float& cy) const
@@ -1328,6 +1554,20 @@ void FrameRenderer::viewMap (float& zx, float& zy, float& cx, float& cy) const
 
 void FrameRenderer::shutdown()
 {
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    if (metalRenderer_ != nullptr)
+    {
+        metalRenderer_->shutdown (gl_);
+        metalRenderer_.reset();
+    }
+    if (metalOnly_)
+    {
+        metalOnly_ = false;
+        gl_ = nullptr;
+        outW_ = outH_ = 0;
+        return;
+    }
+#endif
     if (gl_ == nullptr)
         return;
     releaseTargets();
@@ -1336,9 +1576,9 @@ void FrameRenderer::shutdown()
     if (vao_ != 0) { gl_->DeleteVertexArrays (1, &vao_); vao_ = 0; }
     if (vbo_ != 0) { gl_->DeleteBuffers (1, &vbo_); vbo_ = 0; }
     if (ebo_ != 0) { gl_->DeleteBuffers (1, &ebo_); ebo_ = 0; }
-    for (auto* p : { &layer_.prog, &blend_.prog, &trans_.prog, &fx_.prog,
+    for (auto* p : { &layer_.prog, &drawShape_.prog, &blend_.prog, &trans_.prog, &fx_.prog,
                      &blur_.prog, &sharpen_.prog, &lut_.prog, &blit_.prog,
-                     &canvas_.prog, &feedback_.prog,
+                     &canvas_.prog, &preview_.prog, &feedback_.prog,
                      &bloomThresh_.prog, &bloomCombine_.prog })
         if (*p != 0) { gl_->DeleteProgram (*p); *p = 0; }
     for (auto& g : geom_)
@@ -1366,6 +1606,20 @@ void FrameRenderer::shutdown()
 unsigned FrameRenderer::uploadRgba (const uint8_t* rgba, int width, int height,
                                     int strideBytes, unsigned existingTexture)
 {
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    if (metalOnly_)
+    {
+        unsigned handle = existingTexture;
+        if (handle == 0)
+        {
+            handle = nextMetalHandle_++;
+            if (nextMetalHandle_ == 0) nextMetalHandle_ = 0x80000000u;
+        }
+        if (metalRenderer_ != nullptr)
+            metalRenderer_->uploadRgba (handle, rgba, width, height, strideBytes);
+        return handle;
+    }
+#endif
     GLuint tex = existingTexture;
     if (tex == 0)
     {
@@ -1384,6 +1638,46 @@ unsigned FrameRenderer::uploadRgba (const uint8_t* rgba, int width, int height,
     glTexImage2D (GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0,
                   GL_RGBA, GL_UNSIGNED_BYTE, rgba);
     glPixelStorei (GL_UNPACK_ROW_LENGTH, 0);
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    if (metalRenderer_ != nullptr)
+        metalRenderer_->uploadRgba (tex, rgba, width, height, strideBytes);
+#endif
+    return tex;
+}
+
+unsigned FrameRenderer::uploadR16 (const uint16_t* pixels, int width, int height,
+                                   unsigned existingTexture)
+{
+    if (pixels == nullptr || width <= 0 || height <= 0 || width > 16384 || height > 16384)
+        return 0;
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    if (metalOnly_)
+    {
+        unsigned handle = existingTexture;
+        if (handle == 0)
+        {
+            handle = nextMetalHandle_++;
+            if (nextMetalHandle_ == 0) nextMetalHandle_ = 0x80000000u;
+        }
+        if (metalRenderer_ == nullptr
+            || ! metalRenderer_->uploadR16 (handle, pixels, width, height))
+            return 0;
+        return handle;
+    }
+#endif
+    GLuint tex = existingTexture;
+    if (tex == 0) glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    GLint previousAlignment = 4;
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &previousAlignment);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R16, width, height, 0, GL_RED,
+                 GL_UNSIGNED_SHORT, pixels);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, previousAlignment);
     return tex;
 }
 
@@ -1391,6 +1685,12 @@ void FrameRenderer::deleteTexture (unsigned texture)
 {
     if (texture != 0)
     {
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+        if (metalRenderer_ != nullptr)
+            metalRenderer_->deleteTexture (texture);
+        if (metalOnly_)
+            return;
+#endif
         GLuint t = texture;
         glDeleteTextures (1, &t);
     }
@@ -1401,6 +1701,20 @@ unsigned FrameRenderer::uploadLut3D (const float* rgbTriples, int size,
 {
     if (rgbTriples == nullptr || size < 2)
         return existingTexture;
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    if (metalOnly_)
+    {
+        unsigned handle = existingTexture;
+        if (handle == 0)
+        {
+            handle = nextMetalHandle_++;
+            if (nextMetalHandle_ == 0) nextMetalHandle_ = 0x80000000u;
+        }
+        if (metalRenderer_ != nullptr)
+            metalRenderer_->uploadLut3D (handle, rgbTriples, size);
+        return handle;
+    }
+#endif
     GLuint tex = existingTexture;
     if (tex == 0)
         glGenTextures (1, &tex);
@@ -1415,6 +1729,10 @@ unsigned FrameRenderer::uploadLut3D (const float* rgbTriples, int size,
     gl_->TexImage3D (GL_TEXTURE_3D, 0, GL_RGB32F, size, size, size, 0,
                      GL_RGB, GL_FLOAT, rgbTriples);
     glBindTexture (GL_TEXTURE_3D, 0);
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    if (metalRenderer_ != nullptr)
+        metalRenderer_->uploadLut3D (tex, rgbTriples, size);
+#endif
     return tex;
 }
 
@@ -1625,10 +1943,10 @@ unsigned FrameRenderer::runEffectChain (const LayerDesc& layer)
     {
         const int key = (layer.clipId << 8) | (fbSlot & 0xFF);
         FeedbackHistory& hist = feedbackHistory_[key];
-        if (hist.tex[0] == 0 || hist.tex[1] == 0 || hist.w != outW_ || hist.h != outH_)
+        if (layer.feedbackHistoryReset || hist.tex[0] == 0 || hist.tex[1] == 0
+            || hist.w != outW_ || hist.h != outH_)
         {
-            // Clip start / first use / canvas resize: (re)allocate cleared so
-            // the trail begins from transparent black (PINGPONG.md §3).
+            // Clip start / seek / revision / resize: (re)allocate cleared.
             for (int b = 0; b < 2; ++b)
             {
                 if (hist.tex[b] != 0) glDeleteTextures (1, &hist.tex[b]);
@@ -1639,12 +1957,20 @@ unsigned FrameRenderer::runEffectChain (const LayerDesc& layer)
             }
             hist.w = outW_;
             hist.h = outH_;
+            hist.current = 0;
+            hist.ready = false;
         }
-        // Read last frame's buffer, write this frame's; frameParity_ flips the
-        // roles next frame so trails accumulate without read-after-write.
-        const unsigned readTex  = hist.tex[(frameParity_ + 1) & 1];
-        const unsigned writeTex = hist.tex[frameParity_ & 1];
-        attachTarget (writeTex);
+        if (layer.feedbackHistoryHold && hist.ready)
+        {
+            cur = hist.tex[hist.current];
+        }
+        else
+        {
+            const unsigned readIndex = hist.ready ? hist.current : 0;
+            const unsigned writeIndex = hist.ready ? (hist.current ^ 1u) : 1u;
+            const unsigned readTex = hist.tex[readIndex];
+            const unsigned writeTex = hist.tex[writeIndex];
+            attachTarget (writeTex);
         gl_->UseProgram (feedback_.prog);
         setPassthrough (feedback_.uTransform, feedback_.uCrop);
         bindTexture (0, cur, feedback_.uTexture);
@@ -1657,6 +1983,9 @@ unsigned FrameRenderer::runEffectChain (const LayerDesc& layer)
         drawQuad();
         gl_->ActiveTexture (GL_TEXTURE0);   // leave unit 0 active for later passes
         cur = writeTex;
+        hist.current = writeIndex;
+        hist.ready = true;
+        }
     }
 
     return cur;
@@ -1694,6 +2023,10 @@ void FrameRenderer::drawLayerGeometry (unsigned sourceTexture, const LayerDesc& 
 
     gl_->UseProgram (layer_.prog);
     gl_->UniformMatrix4fv (layer_.uTransform, 1, GL_FALSE, m);
+    gl_->Uniform1i (layer_.uCornerPin, layer.cornerPin ? 1 : 0);
+    for (int i = 0; i < 4; ++i)
+        gl_->Uniform2f (layer_.uCorners + i, layer.corners[(size_t) i * 2],
+                       layer.corners[(size_t) i * 2 + 1]);
     gl_->Uniform4f (layer_.uCrop, layer.cropLeft, layer.cropRight,
                     layer.cropTop, layer.cropBottom);
     gl_->Uniform1f (layer_.uOpacity, opacity);
@@ -1705,6 +2038,31 @@ void FrameRenderer::drawLayerGeometry (unsigned sourceTexture, const LayerDesc& 
                     layer.maskW, layer.maskH);
     gl_->Uniform1f (layer_.uMaskFeather, layer.maskFeather);
     gl_->Uniform1i (layer_.uMaskInvert, layer.maskInvert ? 1 : 0);
+    const bool matte = layer.matteApply && layer.matteTexture != 0
+        && layer.matteWidth > 0 && layer.matteHeight > 0;
+    gl_->Uniform1i (layer_.uMatteApply, matte ? 1 : 0);
+    gl_->Uniform2f (layer_.uMatteTexel, matte ? 1.0f / layer.matteWidth : 0.0f,
+                    matte ? 1.0f / layer.matteHeight : 0.0f);
+    gl_->Uniform4f (layer_.uMatteRefine, layer.matteBlack, layer.matteWhite,
+                    layer.matteErodeDilate, layer.matteFeather);
+    gl_->Uniform1f (layer_.uMatteChoke, layer.matteChoke);
+    gl_->Uniform1i (layer_.uMatteInvert, layer.matteInvert ? 1 : 0);
+    bindTexture (1, matte ? layer.matteTexture : sourceTexture, layer_.uMatteTexture);
+    gl_->Uniform1i(layer_.uMatteCombineMode, layer.matteCombineMode);
+    bindTexture(3, matte && layer.matteCombineMode >= 0 ? layer.matteTextureB : sourceTexture,
+                layer_.uMatteTextureB);
+    const int depthEffect = layer.depthEffect != 0 ? layer.depthEffect : (layer.depthFog ? 1 : 0);
+    const bool depthFog = depthEffect != 0 && layer.depthTexture != 0
+        && layer.depthWidth > 0 && layer.depthHeight > 0;
+    gl_->Uniform1i(layer_.uDepthFog, depthFog ? depthEffect : 0);
+    if (depthEffect <= 1) {
+        gl_->Uniform3f(layer_.uFogRangeDensity, layer.fogNear, layer.fogFar, layer.fogDensity);
+        gl_->Uniform4f(layer_.uFogColor, layer.fogRed, layer.fogGreen, layer.fogBlue, layer.fogAlpha);
+    } else {
+        gl_->Uniform3f(layer_.uFogRangeDensity, layer.depthParam0, layer.depthParam1, layer.depthParam2);
+        gl_->Uniform4f(layer_.uFogColor, layer.depthColorRed, layer.depthColorGreen, layer.depthColorBlue, 1.0f);
+    }
+    bindTexture(2, depthFog ? layer.depthTexture : sourceTexture, layer_.uDepthTexture);
     bindTexture (0, sourceTexture, layer_.uTexture);
     drawQuad();
 }
@@ -1769,6 +2127,20 @@ void FrameRenderer::blendOnto (unsigned frontTexture, unsigned backTexture,
 unsigned FrameRenderer::frameBlendInto (unsigned texA, unsigned texB, unsigned outTex,
                                         int width, int height, float mix)
 {
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    if (metalOnly_)
+    {
+        unsigned handle = outTex;
+        if (handle == 0)
+        {
+            handle = nextMetalHandle_++;
+            if (nextMetalHandle_ == 0) nextMetalHandle_ = 0x80000000u;
+        }
+        if (metalRenderer_ != nullptr)
+            metalRenderer_->setFrameBlend (handle, texA, texB, width, height, mix);
+        return handle;
+    }
+#endif
     GLuint tex = outTex;
     if (tex == 0)
     {
@@ -1823,6 +2195,7 @@ void FrameRenderer::drawImageOverlay (const ImageLayerDesc& overlay, unsigned ta
 
     gl_->UseProgram (layer_.prog);
     gl_->UniformMatrix4fv (layer_.uTransform, 1, GL_FALSE, m);
+    gl_->Uniform1i (layer_.uCornerPin, 0);
     gl_->Uniform4f (layer_.uCrop, 0.0f, 0.0f, 0.0f, 0.0f);
     gl_->Uniform1f (layer_.uOpacity, 1.0f); // opacity applied at blend
     gl_->Uniform1i (layer_.uBlendMode, 0);
@@ -1835,7 +2208,19 @@ void FrameRenderer::drawImageOverlay (const ImageLayerDesc& overlay, unsigned ta
 unsigned FrameRenderer::renderComposite (const LayerDesc* layers, int numLayers,
                                          const ImageLayerDesc* overlays, int numOverlays)
 {
+    particleBackend_ = "none";
     ++frameParity_;   // one step per composited frame (feedback double-buffer swap)
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    if (metalRenderer_ != nullptr)
+        if (const unsigned nativeTexture = metalRenderer_->renderComposite (
+                gl_, layers, numLayers, overlays, numOverlays))
+        {
+            particleBackend_ = metalRenderer_->particleBackend();
+            compositorBackend_ = "metal";
+            return nativeTexture;
+        }
+#endif
+    compositorBackend_ = "opengl";
     gl_->BindFramebuffer (GL_FRAMEBUFFER, fbo_);
     glViewport (0, 0, outW_, outH_);
 
@@ -1868,7 +2253,7 @@ unsigned FrameRenderer::renderComposite (const LayerDesc* layers, int numLayers,
     for (int i = 0; i < numLayers; ++i)
     {
         const LayerDesc& layer = layers[i];
-        if (layer.texture == 0 && ! layer.shaderSource && ! layer.particleSource
+        if (layer.texture == 0 && ! layer.shaderSource && ! layer.particleSource && ! layer.drawShape
             && layer.transitionType == 0 && ! layer.isAdjustment)
             continue;
 
@@ -1927,6 +2312,8 @@ unsigned FrameRenderer::renderComposite (const LayerDesc* layers, int numLayers,
             if (gtex == 0)
                 continue;          // no compiled program yet → render nothing
             local = layer;
+            if (layer.effects == &layer.graphFeedbackEffect)
+                local.effects = &local.graphFeedbackEffect;
             local.texture = gtex;
             local.texWidth = outW_;
             local.texHeight = outH_;
@@ -1939,6 +2326,12 @@ unsigned FrameRenderer::renderComposite (const LayerDesc* layers, int numLayers,
             // chain as a shader/decoded layer. v1 params ride genParams; the
             // spawn-track's notes (noteFeatures) seed the pool.
             ParticleParams pp;
+            if (layer.particleStateReset)
+            {
+                const auto existing = particleGens_.find(layer.clipId);
+                if (existing != particleGens_.end())
+                    existing->second->resetSimulation(gl_);
+            }
             auto gp = [&layer] (const char* k, double dflt) -> double {
                 const auto it = layer.genParams.find (k);
                 return it != layer.genParams.end() ? it->second : dflt;
@@ -1948,26 +2341,117 @@ unsigned FrameRenderer::renderComposite (const LayerDesc* layers, int numLayers,
             pp.size       = (float) gp ("size", 2.0);
             pp.gravity    = (float) gp ("gravity", 0.0);
             pp.force      = (float) gp ("force", 1.0);
+            const bool nativeBuiltin = gp ("nativeBuiltin", 0.0) >= 0.5;
+            pp.seed       = (int) gp ("seed", 0.0);
+            pp.lifetime   = (float) gp ("lifetime", 0.0);
+            if (nativeBuiltin)
+            {
+                pp.force = (float) gp ("speed", 1.0);
+                pp.red = (float) gp ("red", 0.2);
+                pp.green = (float) gp ("green", 0.7);
+                pp.blue = (float) gp ("blue", 1.0);
+                pp.alpha = (float) gp ("alpha", 1.0);
+            }
+            NoteFeatures builtInNotes;
+            const NoteFeatures* particleNotes = layer.notesPresent ? &layer.noteFeatures : nullptr;
+            if (nativeBuiltin)
+            {
+                const int triggerRows = layer.particleTriggerConnected
+                    ? std::clamp (layer.particleTriggerCount, 0, 128) : 1;
+                if (triggerRows > 0)
+                {
+                    builtInNotes.notesTex.resize (128u * 4u * 4u, 0.0f);
+                    for (int row = 0; row < triggerRows; ++row)
+                    {
+                        const auto offset = static_cast<std::size_t> (row) * 16u;
+                        builtInNotes.notesTex[offset] = static_cast<float> (60 + row % 12);
+                        builtInNotes.notesTex[offset + 1] = layer.particleTriggerConnected
+                            ? layer.particleTriggerStrength : 1.0f;
+                        builtInNotes.notesTex[offset + 4] = 261.625565f;
+                        builtInNotes.notesTex[offset + 6] = static_cast<float> (pp.spawnTrack);
+                    }
+                    builtInNotes.noteCount = triggerRows;
+                    particleNotes = &builtInNotes;
+                }
+                else
+                    particleNotes = nullptr;
+            }
             const unsigned gtex = renderClipParticlesToTexture (
-                layer.clipId, layer.shaderClock, pp,
-                layer.notesPresent ? &layer.noteFeatures : nullptr);
+                layer.clipId, layer.visualPlanStructuralRevision, layer.particleNodeId,
+                layer.visualPlanTelemetryHold, layer.shaderClock, pp, particleNotes);
             gl_->BindFramebuffer (GL_FRAMEBUFFER, fbo_);
             glViewport (0, 0, outW_, outH_);
             if (gtex == 0)
                 continue;          // compute unavailable → render nothing
             local = layer;
+            if (layer.effects == &layer.graphFeedbackEffect)
+                local.effects = &local.graphFeedbackEffect;
             local.texture = gtex;
             local.texWidth = outW_;
             local.texHeight = outH_;
             use = &local;
         }
 
-        float blendOpacity = 1.0f;
-        const unsigned front = buildLayerFrame (*use, blendOpacity);
-        // buildLayerFrame rebinds attachments; restore viewport-sized target.
-        blendOnto (front, accumTex_[read], accumTex_[read ^ 1],
-                   blendOpacity, use->blendMode);
-        read ^= 1;
+        if (use->texture != 0 || use->shaderSource || use->particleSource
+            || use->transitionType != 0)
+        {
+            float blendOpacity = 1.0f;
+            const unsigned front = buildLayerFrame (*use, blendOpacity);
+            if (use->clipId == transformInspectionClip_ && use->transitionType == 0
+                && ! use->inspectionDrawShapeOutput)
+            {
+                if (transformInspectionTex_ == 0)
+                    transformInspectionTex_ = createOutputTexture();
+                attachTarget (transformInspectionTex_);
+                gl_->UseProgram (blit_.prog);
+                bindTexture (0, front, blit_.uTexture);
+                drawQuad();
+                transformInspectionReady_ = true;
+            }
+            // buildLayerFrame rebinds attachments; restore viewport-sized target.
+            blendOnto (front, accumTex_[read], accumTex_[read ^ 1],
+                       blendOpacity, use->blendMode);
+            read ^= 1;
+        }
+
+        if (use->drawShape)
+        {
+            const auto drawShapeStarted = std::chrono::steady_clock::now();
+            attachTarget (layerTexB_);
+            glClearColor (0.0f, 0.0f, 0.0f, 0.0f);
+            glClear (GL_COLOR_BUFFER_BIT);
+            gl_->UseProgram (drawShape_.prog);
+            setPassthrough (drawShape_.uTransform, drawShape_.uCrop);
+            gl_->Uniform4f (drawShape_.uRect, use->drawShapeCx, use->drawShapeCy,
+                            use->drawShapeEllipse ? -std::max (use->drawShapeW, 0.0f)
+                                                  : std::max (use->drawShapeW, 0.0f),
+                            std::max (use->drawShapeH, 0.0f));
+            gl_->Uniform4f (drawShape_.uColor,
+                            std::clamp (use->drawShapeR, 0.0f, 1.0f),
+                            std::clamp (use->drawShapeG, 0.0f, 1.0f),
+                            std::clamp (use->drawShapeB, 0.0f, 1.0f),
+                            std::clamp (use->drawShapeA, 0.0f, 1.0f));
+            drawQuad();
+            if (visualTelemetry_ != nullptr && use->drawShapeNodeId != 0)
+                visualTelemetry_->recordNodeEvaluation(use->clipId,
+                    use->visualPlanStructuralRevision, use->drawShapeNodeId,
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - drawShapeStarted).count()),
+                    use->visualPlanTelemetryHold);
+            if (use->inspectionDrawShapeOutput
+                && use->clipId == transformInspectionClip_)
+            {
+                if (transformInspectionTex_ == 0)
+                    transformInspectionTex_ = createOutputTexture();
+                attachTarget (transformInspectionTex_);
+                gl_->UseProgram (blit_.prog);
+                bindTexture (0, layerTexB_, blit_.uTexture);
+                drawQuad();
+                transformInspectionReady_ = true;
+            }
+            blendOnto (layerTexB_, accumTex_[read], accumTex_[read ^ 1], 1.0f, 0);
+            read ^= 1;
+        }
     }
 
     for (int i = 0; i < numOverlays; ++i)
@@ -1983,11 +2467,56 @@ unsigned FrameRenderer::renderComposite (const LayerDesc* layers, int numLayers,
     return applyPostFx (accumTex_[read]);
 }
 
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+bool FrameRenderer::renderCompositeToIOSurface (
+    void* ioSurface, int width, int height,
+    const LayerDesc* layers, int numLayers,
+    const ImageLayerDesc* overlays, int numOverlays)
+{
+    particleBackend_ = "none";
+    ++frameParity_;
+    if (metalRenderer_ == nullptr || ioSurface == nullptr)
+    {
+        compositorBackend_ = "metal-zero-copy-unavailable";
+        return false;
+    }
+    const bool rendered = metalRenderer_->renderCompositeToIOSurface (
+        gl_, ioSurface, width, height, layers, numLayers, overlays, numOverlays);
+    particleBackend_ = metalRenderer_->particleBackend();
+    compositorBackend_ = rendered ? "metal-zero-copy" : "metal-zero-copy-rejected";
+    return rendered;
+}
+
+void FrameRenderer::clearMetalDirectOutputs()
+{
+    if (metalRenderer_ != nullptr) metalRenderer_->clearDirectOutputs();
+}
+
+void FrameRenderer::setMetalInspectionPresentation (
+    unsigned requestedHandle, const videopreview::State& state)
+{
+    metalInspectionRequestedHandle_ = requestedHandle;
+    metalInspectionPresentation_ = state;
+    if (metalRenderer_ != nullptr)
+        metalRenderer_->setInspection (transformInspectionClip_, requestedHandle, state);
+}
+
+bool FrameRenderer::metalInspectionResourceAdmitted() const
+{
+    return metalOnly_ && metalRenderer_ != nullptr
+        && metalRenderer_->inspectionResourceAdmitted();
+}
+#endif
+
 // ---- Shader-generator sources (M3) ---------------------------------------
 
 bool FrameRenderer::setClipShader (int clipId, const std::string& source,
                                    std::string& logOut, std::vector<GenParam>& paramsOut)
 {
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    if (metalOnly_ && metalRenderer_ != nullptr)
+        return metalRenderer_->setClipShader (clipId, source, logOut, paramsOut);
+#endif
     if (gl_ == nullptr) { logOut = "renderer not initialized"; return false; }
     auto& gen = shaderGens_[clipId];
     if (gen == nullptr)
@@ -2000,6 +2529,13 @@ bool FrameRenderer::setClipShader (int clipId, const std::string& source,
 
 void FrameRenderer::clearClipShader (int clipId)
 {
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    if (metalOnly_ && metalRenderer_ != nullptr)
+    {
+        metalRenderer_->clearClipShader (clipId);
+        return;
+    }
+#endif
     auto it = shaderGens_.find (clipId);
     if (it != shaderGens_.end())
     {
@@ -2022,6 +2558,13 @@ void FrameRenderer::clearClipShader (int clipId)
 void FrameRenderer::setClipImage (int clipId, const std::string& name,
                                   const uint8_t* rgba, int width, int height, int strideBytes)
 {
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    if (metalOnly_ && metalRenderer_ != nullptr)
+    {
+        metalRenderer_->setClipImage (clipId, name, rgba, width, height, strideBytes);
+        return;
+    }
+#endif
     if (gl_ == nullptr || rgba == nullptr || width <= 0 || height <= 0)
         return;
     auto& byName = clipImageTex_[clipId];
@@ -2033,6 +2576,10 @@ void FrameRenderer::setClipImage (int clipId, const std::string& name,
 
 bool FrameRenderer::hasClipShader (int clipId) const
 {
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    if (metalOnly_ && metalRenderer_ != nullptr)
+        return metalRenderer_->hasClipShader (clipId);
+#endif
     auto it = shaderGens_.find (clipId);
     return it != shaderGens_.end() && it->second != nullptr && it->second->hasProgram();
 }
@@ -2049,10 +2596,18 @@ unsigned FrameRenderer::renderClipShaderToTexture (int clipId, const ShaderClock
     if (const auto im = clipImageTex_.find (clipId);
         im != clipImageTex_.end() && ! im->second.empty())
         imgs = &im->second;
-    return it->second->render (gl_, clock, outW_, outH_, audio, notes, genValues, imgs);
+    const auto started = std::chrono::steady_clock::now();
+    const auto texture = it->second->render (gl_, clock, outW_, outH_, audio, notes, genValues, imgs);
+    if (visualTelemetry_ != nullptr)
+        visualTelemetry_->recordExecutionObservation(videowire::VisualExecutionKind::generator,
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - started).count()));
+    return texture;
 }
 
-unsigned FrameRenderer::renderClipParticlesToTexture (int clipId, const ShaderClock& clock,
+unsigned FrameRenderer::renderClipParticlesToTexture (int clipId, uint64_t structuralRevision,
+                                                      int stableNodeId, bool telemetryHold,
+                                                      const ShaderClock& clock,
                                                       const ParticleParams& params,
                                                       const NoteFeatures* notes)
 {
@@ -2060,7 +2615,19 @@ unsigned FrameRenderer::renderClipParticlesToTexture (int clipId, const ShaderCl
     auto& eng = particleGens_[clipId];
     if (eng == nullptr)
         eng = std::make_unique<ParticleEngine>();
-    return eng->render (gl_, clock, outW_, outH_, params, notes);
+    const auto started = std::chrono::steady_clock::now();
+    const unsigned texture = eng->render (gl_, clock, outW_, outH_, params, notes);
+    if (visualTelemetry_ != nullptr)
+    {
+        const auto elapsed = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count());
+        visualTelemetry_->recordExecutionObservation(videowire::VisualExecutionKind::particle, elapsed);
+        if (stableNodeId != 0)
+            visualTelemetry_->recordNodeEvaluation(clipId, structuralRevision, stableNodeId, elapsed,
+                telemetryHold);
+    }
+    particleBackend_ = eng->log().empty() ? "pending" : eng->log();
+    return texture;
 }
 
 void FrameRenderer::setPostFx (float bloomIntensity, float bloomThreshold,
@@ -2071,11 +2638,20 @@ void FrameRenderer::setPostFx (float bloomIntensity, float bloomThreshold,
     bloomRadius_    = bloomRadius > 0.0f ? bloomRadius : 0.0f;
     tonemapMode_    = (tonemap >= 0 && tonemap <= 2) ? tonemap : 0;
     exposure_       = exposure > 0.0f ? exposure : 1.0f;
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    if (metalRenderer_ != nullptr)
+        metalRenderer_->setPostFx (bloomIntensity_, bloomThreshold_, bloomRadius_,
+                                   tonemapMode_, exposure_);
+#endif
 }
 
 void FrameRenderer::setBackgroundColor (float r, float g, float b, float a)
 {
     bgR_ = r; bgG_ = g; bgB_ = b; bgA_ = a;
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    if (metalRenderer_ != nullptr)
+        metalRenderer_->setBackgroundColor (r, g, b, a);
+#endif
 }
 
 unsigned FrameRenderer::applyPostFx (unsigned compositeTexture)
@@ -2183,14 +2759,42 @@ unsigned FrameRenderer::applyCanvasFrame (unsigned compositeTexture)
     return target;
 }
 
-void FrameRenderer::presentToWindow (unsigned compositeTexture, int fbWidth, int fbHeight)
+unsigned FrameRenderer::applyNodePreview (unsigned finalTexture, unsigned previewTexture,
+                                           const videopreview::State& state)
 {
+    if (gl_ == nullptr || state.layout == videopreview::Layout::hidden
+        || previewTexture == 0 || preview_.prog == 0)
+        return finalTexture;
+    const bool toPresent = presentW_ > 0 && presentTex_ != 0;
+    const unsigned target = toPresent ? presentTex_
+        : (finalTexture == accumTex_[0] ? accumTex_[1] : accumTex_[0]);
+    gl_->BindFramebuffer (GL_FRAMEBUFFER, fbo_);
+    attachTarget (target);
+    glViewport (0, 0, toPresent ? presentW_ : outW_, toPresent ? presentH_ : outH_);
+    glDisable (GL_BLEND);
+    gl_->UseProgram (preview_.prog);
+    bindTexture (0, finalTexture, preview_.uFinal);
+    bindTexture (1, previewTexture, preview_.uPreview);
+    gl_->Uniform1i (preview_.uLayout, static_cast<int> (state.layout));
+    gl_->Uniform1i (preview_.uBackground, static_cast<int> (state.background));
+    gl_->Uniform1f (preview_.uZoom, state.zoom);
+    gl_->Uniform2f (preview_.uPan, state.panX, state.panY);
+    gl_->Uniform1f (preview_.uSplit, state.split);
+    drawQuad();
+    gl_->BindFramebuffer (GL_FRAMEBUFFER, 0);
+    return target;
+}
+
+bool FrameRenderer::presentToWindow (unsigned compositeTexture, int fbWidth, int fbHeight)
+{
+    if (compositeTexture == 0 || fbWidth <= 0 || fbHeight <= 0) return false;
     gl_->BindFramebuffer (GL_FRAMEBUFFER, 0);
     glViewport (0, 0, fbWidth, fbHeight);
     glDisable (GL_BLEND);
     gl_->UseProgram (blit_.prog);
     bindTexture (0, compositeTexture, blit_.uTexture);
     drawQuad();
+    return glGetError() == GL_NO_ERROR;
 }
 
 bool FrameRenderer::renderToPixels (const LayerDesc* layers, int numLayers,

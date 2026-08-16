@@ -31,6 +31,9 @@
 //
 #include <string>
 #include <map>
+#include <chrono>
+#include <cstdlib>
+#include <limits>
 
 #if ARBIT_HAVE_LUA
 extern "C" {
@@ -107,7 +110,8 @@ public:
     // Compile the script and run its top-level once (setup). Returns true iff it
     // compiled, ran, and defined a global `frame` function. errOut carries the
     // Lua message on failure. A no-op returning false when built without Lua.
-    bool compile (const std::string& source, std::string& errOut);
+    bool compile (const std::string& source, std::string& errOut,
+                  uint32_t cpuMs = 25, uint32_t memoryMiB = 64);
 
     bool valid() const
     {
@@ -130,6 +134,47 @@ private:
    #if ARBIT_HAVE_LUA
     lua_State* L_ = nullptr;
     bool hasFrameFn_ = false;
+public:
+    struct AllocatorTestState
+    {
+        size_t used=0, maximum=0;
+        bool accountingValid=true;
+        uint32_t cpuMs=25;
+        std::chrono::steady_clock::time_point deadline{};
+    };
+    static void* testAllocate (AllocatorTestState& state, void* ptr,
+                               size_t oldSize, size_t newSize)
+    { return allocate(&state, ptr, oldSize, newSize); }
+private:
+    using Limits = AllocatorTestState;
+    Limits limits_;
+    static void* allocate (void* opaque, void* ptr, size_t oldSize, size_t newSize)
+    {
+        auto& l = *static_cast<Limits*> (opaque);
+        if (! l.accountingValid) return nullptr;
+        // Lua documents oldSize as a type tag, not an allocation size, when ptr is null.
+        const size_t accountedOld = ptr == nullptr ? 0 : oldSize;
+        if (ptr != nullptr && accountedOld > l.used) { l.accountingValid = false; return nullptr; }
+        if (newSize == 0)
+        {
+            if (ptr != nullptr) { l.used -= accountedOld; std::free (ptr); }
+            return nullptr;
+        }
+        const size_t base = l.used - accountedOld;
+        if (base > l.maximum || newSize > l.maximum - base) return nullptr;
+        if (auto* replacement = std::realloc (ptr, newSize))
+        {
+            l.used = base + newSize;
+            return replacement;
+        }
+        return nullptr;
+    }
+    static void deadlineHook (lua_State* state, lua_Debug*)
+    {
+        auto* self=*static_cast<LuaHook**>(lua_getextraspace(state));
+        if(std::chrono::steady_clock::now() >= self->limits_.deadline) luaL_error(state,"Lua CPU deadline exceeded");
+    }
+    void armDeadline() { limits_.deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(limits_.cpuMs); }
    #endif
 };
 
@@ -141,11 +186,30 @@ inline void LuaHook::close()
     hasFrameFn_ = false;
 }
 
-inline bool LuaHook::compile (const std::string& source, std::string& errOut)
+inline bool LuaHook::compile (const std::string& source, std::string& errOut,
+                             uint32_t cpuMs, uint32_t memoryMiB)
 {
     close();
-    L_ = luaL_newstate();
+    constexpr size_t bytesPerMiB = 1024u * 1024u;
+    if (memoryMiB > std::numeric_limits<size_t>::max() / bytesPerMiB)
+    {
+        errOut = "Lua memory limit overflow";
+        return false;
+    }
+    limits_ = {};
+    limits_.cpuMs=cpuMs;
+    limits_.maximum=static_cast<size_t>(memoryMiB) * bytesPerMiB;
+#if LUA_VERSION_NUM >= 505
+    // Lua 5.5 makes the string-table seed explicit. Keep it fixed because the
+    // programmable export contract is byte-deterministic and random APIs are
+    // removed from the sandbox below.
+    L_ = lua_newstate(allocate, &limits_, 0);
+#else
+    L_ = lua_newstate(allocate, &limits_);
+#endif
     if (L_ == nullptr) { errOut = "out of memory creating Lua state"; return false; }
+    *static_cast<LuaHook**>(lua_getextraspace(L_)) = this;
+    lua_sethook(L_, deadlineHook, LUA_MASKCOUNT, 1000);
 
     // Safe stdlibs only — no os/io, no package loader.
     luaL_requiref (L_, "_G",     luaopen_base,   1); lua_pop (L_, 1);
@@ -166,6 +230,7 @@ inline bool LuaHook::compile (const std::string& source, std::string& errOut)
     }
     lua_pop (L_, 1);
 
+    armDeadline();
     if (luaL_loadbuffer (L_, source.data(), source.size(), "=arbit_lua_hook") != LUA_OK
         || lua_pcall (L_, 0, 0, 0) != LUA_OK)
     {
@@ -257,6 +322,7 @@ inline bool LuaHook::runFrame (const FrameCtx& ctx,
     }
     lua_setfield (L_, -2, "links");
 
+    armDeadline();
     if (lua_pcall (L_, 1, 1, 0) != LUA_OK)
     {
         const char* msg = lua_tostring (L_, -1);
@@ -283,7 +349,7 @@ inline bool LuaHook::runFrame (const FrameCtx& ctx,
 #else   // ! ARBIT_HAVE_LUA — no-op stubs
 
 inline void LuaHook::close() {}
-inline bool LuaHook::compile (const std::string&, std::string& errOut)
+inline bool LuaHook::compile (const std::string&, std::string& errOut, uint32_t, uint32_t)
 { errOut = "Lua support not compiled in"; return false; }
 inline bool LuaHook::runFrame (const FrameCtx&, std::map<std::string, double>&, std::string&)
 { return true; }

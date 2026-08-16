@@ -26,6 +26,11 @@
 #include "renderer.h" // videorender::EffectSlotState (GL-gated, like this file)
 #include "gpu_caps.h" // arbitgl::GpuCaps (P1 capability layer; dependency-free)
 #include "mod_defs.h" // arbitmod::Score (M5 Block C live score push); plain C++17
+#include "beat_timeline.h"
+#include "video_control_plan.h"
+#include "render_snapshot.h"
+#include "visual_plan_telemetry.h"
+#include "node_preview_presentation.h"
 
 #include <atomic>
 #include <cstdint>
@@ -36,31 +41,7 @@
 #include <thread>
 #include <vector>
 
-// One constant-rate retime span (same shape as ExportSegment — VideoBeatMath
-// on the Arbit side is the single source of truth for the mapping).
-struct ViewportSegment
-{
-    std::string sourcePath;
-    int clipId = 0;
-    double inSec = 0.0, outSec = 0.0, rate = 1.0, displayStartSec = 0.0;
-    int retimeQuality = 0;              // retime interpolation tier (0=Nearest,
-                                        // 1=Frame Blend, 2=Speed Warp/RIFE);
-                                        // mirrors VideoSidecar ExportSegment
-    int trackLayer = 0;                 // compositing layer (v2)
-    int transitionType = 0;             // videofx::TransitionType wire value;
-                                        // leading-edge transition (v2)
-    double transitionDurationSec = 0.0;
-    double sourceFps = 0.0;             // image sequences: pattern frame rate
-                                        // (0 = not a sequence / demuxer default)
-    int seqStart = -1;                  // image sequences: first frame number
-
-    // Shader-generator source (M1 producer / M3 engine): non-empty ⇒ this is a
-    // gen://shader clip whose pixels come from this GLSL program rendered with
-    // the Block A clock, not a decoded MediaContext. Binds to the clip by
-    // clipId and survives the whole-list resend (mirrors the export jobSpec's
-    // clips[].shaderSource). Compiled lazily on the render thread.
-    std::string shaderSource;
-};
+using ViewportSegment = videowire::RenderSegment;
 
 // Per-clip graph parameters (Transform2D + Source compositing + effects).
 // Vocabulary mirrors the original editor's CompositorLayer/keyframe model.
@@ -122,6 +103,11 @@ struct ViewportInfo
     // fallback reason instead of a silent slide to Frame Blend.
     std::string interpError;
     std::string gpuPath;              // "opengl" (presentation API in use)
+    std::string backendPolicy;         // "strict-metal" | "legacy-opengl"
+    std::string compositorBackend = "opengl"; // latest frame: metal|opengl
+    std::string particleBackend = "none"; // latest frame: none|pending|metal|opengl-fragment
+    std::string rendererError;
+    uint64_t fallbackCount = 0;
     uint64_t framesPresented = 0;
     uint64_t lastFrameHash = 0;
     double displaySec = 0.0;          // timeline time currently being rendered
@@ -158,12 +144,14 @@ struct ViewportInfo
     // plugin/agents gate compute-class UI and the export path flag
     // "compute unavailable" (e.g. macOS 4.1) rather than failing.
     arbitgl::GpuCaps gpuCaps;
+    videowire::VisualTelemetrySnapshot graphTelemetry;
 };
 
 class Viewport
 {
 public:
     Viewport();
+    void setDepthCacheRoot(std::string root);
     ~Viewport(); // ctor/dtor out-of-line: Impl is incomplete here
 
     // All methods are called from the RPC (stdin) thread; the render loop
@@ -175,6 +163,11 @@ public:
     std::string open (int width, int height, int x, int y, bool alwaysOnTop,
                       double targetFps, double clkFps = 0.0);
     void close();
+
+    // Pumps visible-window events and applies Cocoa window mutations. The
+    // helper main/RPC thread calls this on macOS because AppKit rejects these
+    // operations from the render worker. It is a no-op on other platforms.
+    void processWindowEvents();
 
     // Zero-copy docked mode (viewport_open_shared): renders the same graph
     // offscreen into shared GPU buffers and signals frames over a
@@ -222,7 +215,21 @@ public:
     void setBounds (int x, int y, int width, int height);
     void setFullscreen (bool fullscreen);
 
-    void setTimeline (std::vector<ViewportSegment> segments);
+    std::string setTimeline (std::vector<ViewportSegment> segments,
+                             std::vector<videowire::CompiledVisualLayerPlan> plans = {},
+                             std::vector<videowire::VisualEventScheduleBinding> eventSchedules = {});
+    std::string setInspectionTarget (int clipId, uint64_t structuralRevision,
+                                     int nodeId, int outputPort);
+    std::string describeInspection() const;
+    std::string setInspectionPresentation (videopreview::State state);
+    bool installSnapshot (videowire::ResolvedVisualSnapshot snapshot);
+    bool beginSnapshot (uint64_t authoringRevision);
+    bool completeSnapshot (videowire::ResolvedVisualSnapshot snapshot);
+    bool rejectSnapshot (uint64_t authoringRevision);
+    videowire::RevisionTuple revisionState() const;
+    bool advanceEvaluation (uint64_t sequence);
+    void acceptStructuralRevision (uint64_t revision) noexcept;
+    void acceptRuntimeRevision (uint64_t revision) noexcept;
     void attachTransport (const std::string& shmName);
 
     // M4 Block B live: attach the audio-sample ring Arbit's audio thread writes
@@ -261,6 +268,13 @@ public:
     // routings layer on the live graph exactly as they do on export. Empty =
     // no overlay (identical to never calling this).
     void setModMatrix (std::vector<arbitmod::Routing> routings);
+    void setControlPlan (videocontrol::Plan plan);
+    bool enqueueVisualEvent(std::string kind, int clipId,
+                            uint64_t sequence, uint64_t epoch);
+
+    // Authoritative project tempo/meter timeline. The same immutable value is
+    // embedded in export jobs, so seeks and per-frame clocks share one evaluator.
+    void setBeatTimeline (videotime::BeatTimeline timeline);
 
     // P2 Scripts-tab live preview: the project-global per-frame hook (Lua OR JS).
     // Mirrors the export jobSpec's luaScript/jsScript/scriptLang; Arbit pushes it
@@ -274,13 +288,15 @@ public:
     // Unlike the exporter the hook is NOT warmed from timeline frame 0 (a live
     // viewport has no canonical t=0), so a script keeping cross-frame globals is
     // best-effort live; the export path stays the deterministic ground truth.
-    void setScript (std::string source, std::string lang);
+    void setScript (std::string source, std::string lang,
+                    uint32_t cpuMs, uint32_t memoryMiB);
 
     // Project canvas (viewport_set_canvas — PROTOCOL.md §Project canvas &
     // view transform): the export-frame coordinate space layers letterbox
     // against. Stored on the Viewport (not Impl) so it survives close/
     // reopen; applies on the next rendered frame. Returns "" on success.
     std::string setCanvas (int width, int height);
+    void setCanvasFrameEnabled (bool enabled) { canvasFrameEnabled_ = enabled; }
 
     // Project canvas background colour (viewport_set_canvas_background) + the
     // bloom/tonemap post stack (viewport_set_post). Both are FRAME-GLOBAL render
@@ -382,14 +398,20 @@ private:
 
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    std::string depthCacheRoot_;
     std::thread thread_;
     std::atomic<bool> running_ { false };
     std::atomic<uint32_t> scopeMask_ { 0 };
+    std::atomic<uint64_t> structuralRevision_ { 0 };
+    std::atomic<uint64_t> runtimeRevision_ { 0 };
+    mutable std::mutex revisionMutex_;
+    videowire::RevisionLedger revisionLedger_;
 
     // Project canvas + viewport-only view transform ("view/zoom|panX|panY"
     // params). On the Viewport (not Impl) so they survive close/reopen; the
     // render loop reads them every frame.
     std::atomic<int> canvasW_ { 0 }, canvasH_ { 0 };
+    std::atomic<bool> canvasFrameEnabled_ { true };
     std::atomic<double> viewZoom_ { 1.0 }, viewPanX_ { 0.0 }, viewPanY_ { 0.0 };
 
     // Frame-global render settings mirrored from the export job for preview ==

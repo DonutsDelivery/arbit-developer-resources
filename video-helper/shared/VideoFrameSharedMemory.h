@@ -15,6 +15,7 @@
   RPC response. The reader validates the generation before and after copying.
 */
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -223,6 +224,17 @@ private:
 // the wall clock; audio is master, video chases.
 
 static constexpr uint32_t kTransportMagic = 0x41565443; // 'AVTC'
+static constexpr uint32_t kTransportVersion = 2;
+static constexpr int kMaxTrackFeatureSlots = 8;
+
+struct TrackFeatureSlot
+{
+    int32_t trackId = -1;
+    uint32_t tapPoint = 0; // 1=track post-FX/pre-fader, 2=group post-FX/pre-fader
+    float rms = 0.0f;
+    float peak = 0.0f;
+    float onset = 0.0f;
+};
 
 struct TransportBlock
 {
@@ -236,6 +248,8 @@ struct TransportBlock
     double sampleRate;
     int64_t hostTimeNs;               // CLOCK_MONOTONIC at write time
     double beatsPerBar;               // time-signature numerator (uBarPhase / ClockBarPhase)
+    uint32_t trackFeatureCount;
+    TrackFeatureSlot trackFeatures[kMaxTrackFeatureSlots];
 };
 
 /** Maps (and optionally creates) the named transport region. Same ownership
@@ -271,7 +285,7 @@ public:
 #endif
         std::memset (base_, 0, sizeof (TransportBlock));
         block()->magic = kTransportMagic;
-        block()->version = 1;
+        block()->version = kTransportVersion;
         return true;
     }
 
@@ -318,7 +332,8 @@ public:
     /** Writer (Arbit audio thread): wait-free, no syscalls. */
     void write (bool playing, double playheadBeats, double bpm,
                 int64_t sampleTime, double sampleRate, int64_t hostTimeNs,
-                double beatsPerBar)
+                double beatsPerBar, const TrackFeatureSlot* features = nullptr,
+                uint32_t featureCount = 0)
     {
         auto* b = block();
         if (b == nullptr) return;
@@ -330,6 +345,11 @@ public:
         b->sampleRate = sampleRate;
         b->hostTimeNs = hostTimeNs;
         b->beatsPerBar = beatsPerBar;
+        const uint32_t bounded = features != nullptr
+            ? std::min<uint32_t>(featureCount, kMaxTrackFeatureSlots) : 0;
+        b->trackFeatureCount = bounded;
+        for (uint32_t i = 0; i < bounded; ++i) b->trackFeatures[i] = features[i];
+        for (uint32_t i = bounded; i < kMaxTrackFeatureSlots; ++i) b->trackFeatures[i] = {};
         b->generation.fetch_add (1, std::memory_order_acq_rel); // -> even
     }
 
@@ -350,6 +370,9 @@ public:
         out.sampleRate = b->sampleRate;
         out.hostTimeNs = b->hostTimeNs;
         out.beatsPerBar = b->beatsPerBar;
+        out.trackFeatureCount = std::min<uint32_t>(b->trackFeatureCount, kMaxTrackFeatureSlots);
+        for (uint32_t i = 0; i < out.trackFeatureCount; ++i)
+            out.trackFeatures[i] = b->trackFeatures[i];
         std::atomic_thread_fence (std::memory_order_acquire);
         const uint32_t g2 = b->generation.load (std::memory_order_acquire);
         if (g2 != g1) return false;

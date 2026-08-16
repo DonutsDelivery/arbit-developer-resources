@@ -34,6 +34,7 @@
 
 #include <string>
 #include <map>
+#include <chrono>
 
 #if ARBIT_HAVE_QUICKJS
 extern "C" {
@@ -59,7 +60,8 @@ public:
     // Compile the script and run its top-level once (setup). Returns true iff it
     // compiled, ran, and defined a global `frame` function. errOut carries the
     // JS message on failure. A no-op returning false when built without QuickJS.
-    bool compile (const std::string& source, std::string& errOut);
+    bool compile (const std::string& source, std::string& errOut,
+                  uint32_t cpuMs = 25, uint32_t memoryMiB = 64);
 
     bool valid() const
     {
@@ -84,6 +86,10 @@ private:
     JSContext* cx_ = nullptr;   // named cx_ to avoid shadowing the JSContext type
     JSValue    frameFn_ {};
     bool hasFrameFn_ = false;
+    uint32_t cpuMs_ = 25;
+    std::chrono::steady_clock::time_point deadline_ {};
+    static int interrupt (JSRuntime*, void* opaque)
+    { return std::chrono::steady_clock::now() >= static_cast<JsHook*>(opaque)->deadline_; }
    #endif
 };
 
@@ -101,11 +107,15 @@ inline void JsHook::close()
     hasFrameFn_ = false;
 }
 
-inline bool JsHook::compile (const std::string& source, std::string& errOut)
+inline bool JsHook::compile (const std::string& source, std::string& errOut,
+                            uint32_t cpuMs, uint32_t memoryMiB)
 {
     close();
     rt_ = JS_NewRuntime();
     if (rt_ == nullptr) { errOut = "out of memory creating JS runtime"; return false; }
+    cpuMs_ = cpuMs;
+    JS_SetMemoryLimit (rt_, static_cast<size_t>(memoryMiB) * 1024u * 1024u);
+    JS_SetInterruptHandler (rt_, interrupt, this);
     cx_ = JS_NewContext (rt_);   // ECMAScript builtins only; no libc/module loader
     if (cx_ == nullptr) { errOut = "out of memory creating JS context"; close(); return false; }
 
@@ -124,11 +134,13 @@ inline bool JsHook::compile (const std::string& source, std::string& errOut)
     static const char* kPrelude =
         "Math.random=undefined;"
         "globalThis.Date=undefined;";
+    deadline_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(cpuMs_);
     JSValue pv = JS_Eval (cx_, kPrelude, std::char_traits<char>::length (kPrelude),
                           "=arbit_js_prelude", JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException (pv)) { JS_FreeValue (cx_, pv); grabException ("JS prelude error"); close(); return false; }
     JS_FreeValue (cx_, pv);
 
+    deadline_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(cpuMs_);
     JSValue r = JS_Eval (cx_, source.data(), source.size(), "=arbit_js_hook",
                          JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException (r)) { JS_FreeValue (cx_, r); grabException ("JS load/run error"); close(); return false; }
@@ -218,6 +230,7 @@ inline bool JsHook::runFrame (const FrameCtx& ctx,
     JS_SetPropertyStr (c, cobj, "links", links);
 
     JSValue argv[1] = { cobj };
+    deadline_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(cpuMs_);
     JSValue res = JS_Call (c, frameFn_, JS_UNDEFINED, 1, argv);
     JS_FreeValue (c, cobj);
 
@@ -261,7 +274,7 @@ inline bool JsHook::runFrame (const FrameCtx& ctx,
 #else   // ! ARBIT_HAVE_QUICKJS — no-op stubs
 
 inline void JsHook::close() {}
-inline bool JsHook::compile (const std::string&, std::string& errOut)
+inline bool JsHook::compile (const std::string&, std::string& errOut, uint32_t, uint32_t)
 { errOut = "JavaScript (QuickJS) support not compiled in"; return false; }
 inline bool JsHook::runFrame (const FrameCtx&, std::map<std::string, double>&, std::string&)
 { return true; }

@@ -45,8 +45,13 @@
 
 #include "gl_loader.h"
 #include "effect_defs.h"
+#include "node_preview_presentation.h"
 #include "shader_generator.h"   // ShaderGenerator, ShaderClock, GenParam
 #include "particle_engine.h"    // ParticleEngine, ParticleParams (P4)
+#include "visual_plan_telemetry.h"
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+#include "gpu_backend/frame_renderer_metal.h"
+#endif
 
 #include <cstdint>
 #include <map>
@@ -94,6 +99,27 @@ struct LayerDesc
     // notesPresent) seed/colour/force the pool. Composited identically to a
     // shader layer (effects rack, transform, blend all apply).
     bool particleSource = false;
+    bool particleStateReset = false;
+    bool particleTriggerConnected = false;
+    int particleTriggerCount = 0;
+    float particleTriggerStrength = 0.0f;
+    // Stable typed-plan identities for operation-local measured telemetry.
+    uint64_t visualPlanStructuralRevision = 0;
+    bool visualPlanTelemetryHold = false;
+    int particleNodeId = 0;
+    int drawShapeNodeId = 0;
+
+    // Typed visual.draw.shape overlay. The helper executor fills this only for
+    // an admitted rectangle/ellipse -> Draw Shape -> Blend branch. Both native
+    // compositors produce it directly on-GPU; no CPU composition/readback exists.
+    bool drawShape = false;
+    // Set only by exact plan inspection admission. The compositor retains the
+    // native texture produced by this draw pass before Blend consumes it.
+    bool inspectionDrawShapeOutput = false;
+    bool drawShapeEllipse = false;
+    float drawShapeCx = 0.5f, drawShapeCy = 0.5f;
+    float drawShapeW = 1.0f, drawShapeH = 1.0f;
+    float drawShapeR = 1.0f, drawShapeG = 1.0f, drawShapeB = 1.0f, drawShapeA = 1.0f;
 
     // Block B audio features (M4): when audioPresent, a shader-generator layer
     // uploads these to uRMS/uPeak/uOnset/uOnsetAge + the uAudioBands sampler
@@ -125,6 +151,9 @@ struct LayerDesc
     float translateY = 0.0f;       // NDC, + moves down on screen
     float rotationDeg = 0.0f;      // + turns clockwise on screen
     float cropLeft = 0.0f, cropRight = 0.0f, cropTop = 0.0f, cropBottom = 0.0f;
+    bool cornerPin = false;
+    std::array<float, 8> corners { -1.0f, 1.0f, 1.0f, 1.0f,
+                                   1.0f,-1.0f,-1.0f,-1.0f };
 
     // source compositing
     float opacity = 1.0f;
@@ -140,6 +169,29 @@ struct LayerDesc
     float maskFeather = 0.05f;     // edge feather width (same 0..1 units)
     bool maskInvert = false;
 
+    // Typed project MatteAsset upload and bounded native-GPU refinement. The
+    // decoder may populate matteTexture, but composition never maps pixels back.
+    unsigned matteTexture = 0;
+    unsigned matteTextureB = 0;
+    int matteWidth = 0, matteHeight = 0;
+    int matteWidthB = 0, matteHeightB = 0;
+    bool matteApply = false, matteInvert = false;
+    int matteCombineMode = -1;
+    float matteBlack = 0.0f, matteWhite = 1.0f;
+    float matteErodeDilate = 0.0f, matteFeather = 0.0f, matteChoke = 0.0f;
+
+    // Exact R16 depth resource and native fog pass. The caller owns the texture
+    // for the duration of renderComposite; FrameRenderer never reopens a path.
+    unsigned depthTexture = 0;
+    int depthWidth = 0, depthHeight = 0;
+    bool depthFog = false;
+    int depthEffect = 0; // 0 none, 1 fog, 2 blur, 3 displacement, 4 relighting
+    float fogNear = 0.0f, fogFar = 1.0f, fogDensity = 1.0f;
+    float fogRed = 1.0f, fogGreen = 1.0f, fogBlue = 1.0f, fogAlpha = 1.0f;
+    float depthParam0 = 0.0f, depthParam1 = 0.0f, depthParam2 = 0.0f;
+    float depthColorRed = 1.0f, depthColorGreen = 1.0f, depthColorBlue = 1.0f;
+
+
     // Per-clip 3D LUT (Arbit extension, Jun 2026): GL_TEXTURE_3D owned by the
     // caller (uploadLut3D), sampled trilinearly after the effects chain.
     // 0 = no LUT.
@@ -150,6 +202,11 @@ struct LayerDesc
     // the color uber-shader applies its fixed in-shader order regardless)
     const EffectSlotState* effects = nullptr;
     int effectCount = 0;
+    // Immutable graph payload lowering storage. The pointer above may target
+    // this slot for the production FeedbackTrail pass.
+    EffectSlotState graphFeedbackEffect;
+    bool feedbackHistoryReset = false;
+    bool feedbackHistoryHold = false;
 
     double timeSec = 0.0;          // uTime (animates film grain)
 
@@ -199,9 +256,16 @@ public:
     // gl must outlive the renderer; the GL context must be current on the
     // calling thread for this and every other method.
     bool initialize (const arbitgl::GlFuncs* gl, int outWidth, int outHeight,
-                     std::string& error);
+                     std::string& error, bool metalOnly = false);
     void shutdown();
-    bool ready() const { return gl_ != nullptr; }
+    bool ready() const
+    {
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+        return metalOnly_ ? metalRenderer_ != nullptr : gl_ != nullptr;
+#else
+        return gl_ != nullptr;
+#endif
+    }
 
     // Reallocates the FBO chain when the size changes (no-op otherwise).
     void setOutputSize (int outWidth, int outHeight);
@@ -252,11 +316,15 @@ public:
     // the composite resolution. Returns the framed texture or the input
     // unchanged when no canvas is set. Call after renderComposite; viewport-only.
     unsigned applyCanvasFrame (unsigned compositeTexture);
+    unsigned applyNodePreview (unsigned finalTexture, unsigned previewTexture,
+                               const videopreview::State& state);
 
     // Creates (existingTexture == 0) or updates an RGBA texture from
     // raster-order pixels. strideBytes must be a multiple of 4.
     unsigned uploadRgba (const uint8_t* rgba, int width, int height,
                          int strideBytes, unsigned existingTexture);
+    unsigned uploadR16 (const uint16_t* pixels, int width, int height,
+                        unsigned existingTexture);
     void deleteTexture (unsigned texture);
 
     // Frame Blend (retime tier 1): alpha-mix two equally-sized bracket frames
@@ -280,10 +348,54 @@ public:
     unsigned renderComposite (const LayerDesc* layers, int numLayers,
                               const ImageLayerDesc* overlays = nullptr,
                               int numOverlays = 0);
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    bool renderCompositeToIOSurface (void* ioSurface, int width, int height,
+                                     const LayerDesc* layers, int numLayers,
+                                     const ImageLayerDesc* overlays = nullptr,
+                                     int numOverlays = 0);
+    void clearMetalDirectOutputs();
+#endif
+
+    // Backend used by a particle layer in the most recent composite frame.
+    // This is deliberately separate from the compositor/presentation path.
+    const std::string& particleBackend() const { return particleBackend_; }
+    const std::string& compositorBackend() const { return compositorBackend_; }
+    void setVisualTelemetryOwner (videowire::VisualPlanTelemetry* owner)
+    {
+        visualTelemetry_ = owner;
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+        if (metalRenderer_ != nullptr) metalRenderer_->setVisualTelemetryOwner(owner);
+#endif
+    }
+
+    // Exact intermediate-resource seam. When requested, renderComposite retains
+    // the matching clip's post-transform layer frame in an owned GPU texture.
+    // It is never mapped/read back and remains valid until resize or shutdown.
+    void setTransformInspectionClip (int clipId)
+    {
+        transformInspectionClip_ = clipId;
+        transformInspectionReady_ = false;
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+        if (metalOnly_ && metalRenderer_ != nullptr)
+            metalRenderer_->setInspection (clipId, metalInspectionRequestedHandle_,
+                                           metalInspectionPresentation_);
+#endif
+    }
+    unsigned transformInspectionTexture() const
+    {
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+        if (metalOnly_ && metalRenderer_ != nullptr)
+            return metalRenderer_->inspectionHandle();
+#endif
+        return transformInspectionReady_ ? transformInspectionTex_ : 0;
+    }
+    void setMetalInspectionPresentation (unsigned requestedHandle,
+                                         const videopreview::State& state);
+    bool metalInspectionResourceAdmitted() const;
 
     // Draws a composited texture 1:1 to the currently bound default
     // framebuffer, flipped upright for window presentation.
-    void presentToWindow (unsigned compositeTexture, int fbWidth, int fbHeight);
+    bool presentToWindow (unsigned compositeTexture, int fbWidth, int fbHeight);
 
     // Offscreen path (exporter seam): composite + synchronous readback.
     // rgbaOut is resized to outWidth*outHeight*4, top row first, stride
@@ -384,6 +496,9 @@ private:
     void viewMap (float& zx, float& zy, float& cx, float& cy) const;
 
     const arbitgl::GlFuncs* gl_ = nullptr;
+    videowire::VisualPlanTelemetry* visualTelemetry_ = nullptr;
+    bool metalOnly_ = false;
+    unsigned nextMetalHandle_ = 0x80000000u;
     int outW_ = 0, outH_ = 0;
     int canvasW_ = 0, canvasH_ = 0;     // 0 = follow output (export path)
     float viewZoom_ = 1.0f, viewPanX_ = 0.0f, viewPanY_ = 0.0f;
@@ -410,6 +525,11 @@ private:
     unsigned layerTexA_ = 0;            // transition A frame
     unsigned layerTexB_ = 0;            // per-layer geometry frame
     unsigned fxTex_[2] = { 0, 0 };      // effects/blur ping-pong + transition out
+    int transformInspectionClip_ = -1;
+    unsigned transformInspectionTex_ = 0;
+    bool transformInspectionReady_ = false;
+    unsigned metalInspectionRequestedHandle_ = 0;
+    videopreview::State metalInspectionPresentation_;
 
     // Cross-frame feedback history (FeedbackTrail effect). Per-(clipId,slot)
     // double-buffered persistent texture: each frame reads one buffer and
@@ -417,7 +537,7 @@ private:
     // Key = (clipId << 8) | slot. Allocated lazily and cleared (trail starts
     // from black at clip start); freed + recreated on resize/shutdown via
     // releaseTargets (PINGPONG.md §3 reset rules).
-    struct FeedbackHistory { unsigned tex[2] = { 0, 0 }; int w = 0, h = 0; };
+    struct FeedbackHistory { unsigned tex[2] = { 0, 0 }; int w = 0, h = 0; unsigned current = 0; bool ready = false; };
     std::map<int, FeedbackHistory> feedbackHistory_;
     unsigned frameParity_ = 0;          // advances once per renderComposite (frame)
 
@@ -436,10 +556,21 @@ private:
     // build on first use). Rendered into the layer's source texture when
     // LayerDesc::particleSource is set; freed on shutdown. Returns 0 when compute
     // is unavailable on this context (the layer then renders nothing).
-    unsigned renderClipParticlesToTexture (int clipId, const ShaderClock& clock,
+    unsigned renderClipParticlesToTexture (int clipId, uint64_t structuralRevision,
+                                           int stableNodeId, bool telemetryHold,
+                                           const ShaderClock& clock,
                                            const ParticleParams& params,
                                            const NoteFeatures* notes);
     std::map<int, std::unique_ptr<ParticleEngine>> particleGens_;
+    std::string particleBackend_ = "none";
+    std::string compositorBackend_ = "opengl";
+
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    // Production macOS compositor. Backend selection is whole-session: this
+    // exists only for a strict Metal renderer, so a rejected frame can never
+    // slide into the legacy OpenGL implementation.
+    std::unique_ptr<MetalFrameRenderer> metalRenderer_;
+#endif
 
     // Decoded image textures for shader clips' `image`-type ISF INPUTS (M7 image
     // follow-up): clipId -> (inputName -> GL texture). Populated by setClipImage,
@@ -476,9 +607,19 @@ private:
     int scopeIdx_ = 0;
 
     // Programs + cached uniform locations.
-    struct LayerProg { unsigned prog = 0; int uTransform = -1, uCrop = -1, uTexture = -1, uOpacity = -1, uBlendMode = -1,
-                       uMaskType = -1, uMaskRect = -1, uMaskFeather = -1, uMaskInvert = -1; } layer_;
+    struct LayerProg { unsigned prog = 0; int uTransform = -1, uCrop = -1, uCornerPin = -1, uCorners = -1,
+                       uTexture = -1, uOpacity = -1, uBlendMode = -1,
+                       uMaskType = -1, uMaskRect = -1, uMaskFeather = -1, uMaskInvert = -1,
+                       uMatteTexture = -1, uMatteTextureB = -1, uMatteApply = -1, uMatteTexel = -1,
+                       uMatteCombineMode = -1,
+                       uMatteRefine = -1, uMatteChoke = -1, uMatteInvert = -1,
+                       uDepthTexture = -1, uDepthFog = -1, uFogRangeDensity = -1,
+                       uFogColor = -1; } layer_;
+    struct DrawShapeProg { unsigned prog = 0; int uTransform = -1, uCrop = -1,
+                           uRect = -1, uColor = -1; } drawShape_;
     struct BlendProg { unsigned prog = 0; int uTransform = -1, uCrop = -1, uFrontTex = -1, uBackTex = -1, uOpacity = -1, uBlendMode = -1; } blend_;
+    struct PreviewProg { unsigned prog = 0; int uFinal = -1, uPreview = -1, uLayout = -1,
+                         uBackground = -1, uZoom = -1, uPan = -1, uSplit = -1; } preview_;
     struct TransProg { unsigned prog = 0; int uTransform = -1, uCrop = -1, uFromTex = -1, uToTex = -1, uProgress = -1, uType = -1; } trans_;
     struct FxProg    { unsigned prog = 0; int uTransform = -1, uCrop = -1, uTexture = -1, uTime = -1, uEffectMask = -1; int uValue[40] = {}; } fx_;
     struct BlurProg  { unsigned prog = 0; int uTransform = -1, uCrop = -1, uTexture = -1, uTexelStep = -1, uRadius = -1; } blur_;

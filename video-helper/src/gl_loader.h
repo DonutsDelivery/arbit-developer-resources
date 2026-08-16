@@ -44,6 +44,7 @@ namespace arbitgl
 // X(typedef, Name) — loaded as "gl" #Name via glfwGetProcAddress.
 #define ARBIT_GL33_FUNCS(X)                                          \
     X (PFNGLACTIVETEXTUREPROC,           ActiveTexture)              \
+    X (PFNGLBLENDFUNCSEPARATEPROC,       BlendFuncSeparate)          \
     X (PFNGLGENBUFFERSPROC,              GenBuffers)                 \
     X (PFNGLBINDBUFFERPROC,              BindBuffer)                 \
     X (PFNGLBUFFERDATAPROC,              BufferData)                 \

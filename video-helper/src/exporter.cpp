@@ -2,15 +2,23 @@
 #include "lua_hook.h"   // M8: per-frame Lua hook (no-op without ARBIT_HAVE_LUA)
 #include "js_hook.h"    // P2: per-frame JS hook (no-op without ARBIT_HAVE_QUICKJS)
 #include "media.h"
+#include "visual_plan_executor.h"
+#include "export_telemetry_owner.h"
 
 #if ARBIT_HAVE_VIEWPORT
 #include "renderer.h"
+#include "depth_texture_runtime.h"
+#include "tracking_runtime.h"
 #include "lut_loader.h"
 #include "block_b_analyzer.h"   // A3 Block B audio-feature analyzer (header-only)
 #include "mix_analyze.h"        // shared decode+offline-analyze (live viewport reuses this)
 #include "block_c_packer.h"     // A2 Block C note/link voice allocator (header-only)
 #include "video_param_grammar.h" // Stage 6: shared render-graph param resolver (single source of truth)
 #include <GLFW/glfw3.h>
+#if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOSurface/IOSurface.h>
+#endif
 #endif
 
 #if ARBIT_HAVE_ONNX
@@ -49,7 +57,12 @@ namespace
 // file uses the `gen://` sentinel sourcePath; it has no MediaContext and must be
 // skipped by every media-decode/probe loop (the GL path renders it from the
 // clip's compiled ShaderGenerator; the no-GL fallback cannot render it at all).
-inline bool isGeneratorPath (const std::string& p) { return p.rfind ("gen://", 0) == 0; }
+inline bool isNonMediaSource (const ExportSegment& segment)
+{
+    return videowire::resolveSourceKind (segment.sourceKind, segment.isAdjustment,
+                                         segment.sourcePath)
+        != videowire::SourceKind::Media;
+}
 
 // Does the project carry GL-composited content the minterpolate CPU path cannot
 // render? That path streams raw per-segment source frames through an FFmpeg
@@ -70,7 +83,7 @@ inline bool minterpolateWouldDropContent (const ExportJob& job)
     bool haveLayer = false; int firstLayer = 0;
     for (const auto& s : job.segments)
     {
-        if (isGeneratorPath (s.sourcePath)) return true;                 // shader/particle clip
+        if (isNonMediaSource (s)) return true;                           // generated/adjustment clip
         if (s.transitionType != 0 || s.transitionDurationSec > 0.0) return true; // transition
         if (! haveLayer) { haveLayer = true; firstLayer = s.trackLayer; }
         else if (s.trackLayer != firstLayer) return true;               // >1 composited layer
@@ -142,7 +155,9 @@ MonoPcm decodeWavToMonoFloat (const std::string& wavPath)
     auto pull = [&] (AVFrame* f /* nullptr = flush swr */)
     {
         const int inN = f != nullptr ? f->nb_samples : 0;
-        const uint8_t* const* inData = f != nullptr ? (const uint8_t* const*) f->data : nullptr;
+        const uint8_t** inData = f != nullptr
+            ? const_cast<const uint8_t**> (f->extended_data)
+            : nullptr;
         const int maxOut = (int) av_rescale_rnd (swr_get_delay (swr, sr) + inN,
                                                  sr, sr, AV_ROUND_UP) + 16;
         if ((int) buf.size() < maxOut) buf.resize ((size_t) maxOut);
@@ -193,6 +208,7 @@ const char* softwareEncoderName (const std::string& codec)
     if (codec == "h265")   return "libx265";
     if (codec == "vp9")    return "libvpx-vp9";
     if (codec == "prores") return "prores_ks";
+    if (codec == "ffv1")   return "ffv1";
     if (codec == "dpx")    return "dpx";        // 10-bit RGB image sequence (image2 muxer)
     return "libx264";
 }
@@ -699,20 +715,53 @@ struct InterpGraph
 
 #if ARBIT_HAVE_VIEWPORT
 
-// -------------------------------------------------- GL composited path (WP6)
+// ----------------------------------------- GPU-composited export path (WP6)
 
-// Hidden offscreen GL 3.3 context for the exporter. Plain GLFW hints (EGL is
-// not required — nothing is dmabuf-exported here). The exporter never calls
-// glfwTerminate(): the viewport thread may own other GLFW windows.
+// macOS renders through the same strict Metal compositor as the viewport into
+// an IOSurface. Other platforms retain the hidden offscreen GL context.
 struct GlExportContext
 {
+#if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
+    IOSurfaceRef surface = nullptr;
+    int width = 0, height = 0;
+#else
     GLFWwindow* win = nullptr;
     arbitgl::GlFuncs gl {};
     arbitgl::GpuCaps gpuCaps {}; // P1: compute caps for this offscreen context
+#endif
     videorender::FrameRenderer renderer;
 
     bool init (int outW, int outH, std::string& errorOut)
     {
+#if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
+        width = std::max (outW, 2);
+        height = std::max (outH, 2);
+        if (! renderer.initialize (nullptr, width, height, errorOut, true))
+            return false;
+        CFMutableDictionaryRef properties = CFDictionaryCreateMutable (
+            kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks);
+        auto setInt = [properties] (CFStringRef key, int value)
+        {
+            CFNumberRef number = CFNumberCreate (
+                kCFAllocatorDefault, kCFNumberIntType, &value);
+            CFDictionarySetValue (properties, key, number);
+            CFRelease (number);
+        };
+        setInt (kIOSurfaceWidth, width);
+        setInt (kIOSurfaceHeight, height);
+        setInt (kIOSurfaceBytesPerElement, 4);
+        setInt (kIOSurfacePixelFormat, static_cast<int32_t> ('BGRA'));
+        surface = IOSurfaceCreate (properties);
+        CFRelease (properties);
+        if (surface == nullptr)
+        {
+            errorOut = "Metal export IOSurface allocation failed";
+            renderer.shutdown();
+            return false;
+        }
+        return true;
+#else
         if (glfwInit() != GLFW_TRUE)
         {
             errorOut = "glfwInit failed (no display?)";
@@ -753,18 +802,83 @@ struct GlExportContext
             return false;
         }
         return true;
+#endif
+    }
+
+    bool renderNext (const videorender::LayerDesc* layers, int numLayers,
+                     std::vector<uint8_t>& rgba, bool& haveOutput,
+                     std::string& errorOut,
+                     const videorender::ImageLayerDesc* overlays, int numOverlays)
+    {
+#if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
+        haveOutput = false;
+        if (surface == nullptr || ! renderer.renderCompositeToIOSurface (
+                surface, width, height, layers, numLayers, overlays, numOverlays))
+        {
+            errorOut = "native Metal export render failed: " + renderer.compositorBackend();
+            return false;
+        }
+        IOSurfaceLock (surface, kIOSurfaceLockReadOnly, nullptr);
+        const auto* bgra = static_cast<const uint8_t*> (IOSurfaceGetBaseAddress (surface));
+        const size_t rowBytes = IOSurfaceGetBytesPerRow (surface);
+        rgba.resize (static_cast<size_t> (width) * height * 4);
+        for (int y = 0; y < height; ++y)
+        {
+            const uint8_t* source = bgra + static_cast<size_t> (y) * rowBytes;
+            uint8_t* dest = rgba.data() + static_cast<size_t> (y) * width * 4;
+            for (int x = 0; x < width; ++x)
+            {
+                dest[x * 4] = source[x * 4 + 2];
+                dest[x * 4 + 1] = source[x * 4 + 1];
+                dest[x * 4 + 2] = source[x * 4];
+                dest[x * 4 + 3] = source[x * 4 + 3];
+            }
+        }
+        IOSurfaceUnlock (surface, kIOSurfaceLockReadOnly, nullptr);
+        haveOutput = true;
+        return true;
+#else
+        return renderer.renderToPixelsAsync (layers, numLayers, rgba, haveOutput,
+                                             errorOut, overlays, numOverlays);
+#endif
+    }
+
+    bool renderWarmup (const videorender::LayerDesc* layers, int numLayers,
+                       const videorender::ImageLayerDesc* overlays, int numOverlays)
+    {
+#if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
+        return surface != nullptr && renderer.renderCompositeToIOSurface (
+            surface, width, height, layers, numLayers, overlays, numOverlays);
+#else
+        return renderer.renderComposite (layers, numLayers, overlays, numOverlays) != 0;
+#endif
+    }
+
+    bool drain (std::vector<uint8_t>& rgba)
+    {
+#if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
+        (void) rgba;
+        return false;
+#else
+        return renderer.drainAsyncReadback (rgba);
+#endif
     }
 
     void shutdown()
     {
         if (renderer.ready())
             renderer.shutdown();
+#if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
+        if (surface != nullptr) CFRelease (surface);
+        surface = nullptr;
+#else
         if (win != nullptr)
         {
             glfwMakeContextCurrent (nullptr);
             glfwDestroyWindow (win);
             win = nullptr;
         }
+#endif
     }
 };
 
@@ -1108,7 +1222,17 @@ struct ExportClipStream
     // image-sequence MediaContext (frame N == source frame N). Decoded at the
     // same canvas fit as the clip frame so the two align pixel-for-pixel.
     std::unique_ptr<MediaContext> matteMedia;
+    std::unique_ptr<MediaContext> matteMediaB;
     bool matteOpenFailed = false;
+    bool matteOpenFailedB = false;
+    unsigned matteTex = 0;
+    unsigned matteTexB = 0;
+    int matteTexW = 0, matteTexH = 0;
+    int matteTexWB = 0, matteTexHB = 0;
+    double matteLastSrcSec = -1.0e9;
+    double matteLastSrcSecB = -1.0e9;
+    std::string matteReceiptB;
+    videohelper::DepthTextureState depth;
 };
 
 // AI roto: multiply a decoded clip frame's alpha by its matte frame (decoded at
@@ -1137,7 +1261,9 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
                             AVFormatContext* fmt, AVStream* vStream,
                             AVCodecContext* vEnc, double rangeStartSec,
                             double durationSec, RifeEnginePtr rife,
-                            ExportProgress* progress)
+                            ExportProgress* progress,
+                            videowire::ExportTelemetryOwner<>* telemetryOwner = nullptr,
+                            std::vector<uint8_t>* capturedPixels = nullptr)
 {
     (void) rife; // unused when built without ONNX
     const auto bakedByClip = parseBakedTimeline (job);
@@ -1267,14 +1393,6 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
         }
     }
 
-    // M8 adjustment clips ("effect the world"): clips with no media/shader that
-    // run their effects rack over the composite beneath them. Like shaderClips,
-    // their segments are dispatched to a dedicated layer-build branch (no decode)
-    // so decodeLayer is never asked for the gen://adjustment sentinel source.
-    std::set<int> adjustmentClips;
-    for (const auto& c : job.clips)
-        if (c.isAdjustment && c.shaderSource.empty())
-            adjustmentClips.insert (c.clipId);
 
     // P4 particle clips: a GPU compute particle pool, no media/shader. Identified
     // by the gen://particles segment sentinel (ExportClipState carries no
@@ -1282,7 +1400,8 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
     // dedicated no-decode layer-build branch, like shader/adjustment clips.
     std::set<int> particleClips;
     for (const auto& s : job.segments)
-        if (s.sourcePath.rfind ("gen://particles", 0) == 0)
+        if (videowire::resolveSourceKind (s.sourceKind, s.isAdjustment, s.sourcePath)
+            == videowire::SourceKind::Particles)
             particleClips.insert (s.clipId);
 
     // Block B audio features (M4): if any shader clip is present and a master
@@ -1349,15 +1468,21 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
     // mid-range export with the full pre-range history), later calls advance one
     // frame, and asking for the same frame twice re-uses the cache (buildFrame
     // never goes backward). The cached value is copied by fillDesc, so returning
-    // a reference is safe. The packed beat matches makeShaderClock (t·bpm/60).
+    // a reference is safe. The packed beat matches the shared beat timeline.
     long packedFrame = -1;
+    videowire::VisualPlanExecutionState visualPlanState;
+    videowire::VisualEventTriggerCursor visualEventCursor (true);
+    if (telemetryOwner != nullptr)
+        visualPlanState.setTelemetryOwner(telemetryOwner->telemetry());
+    visualPlanState.admitPlans(job.visualLayerPlans);
     videorender::NoteFeatures cachedNotes;
     auto notesForFrame = [&] (double t) -> const videorender::NoteFeatures&
     {
         if (! haveScore) return cachedNotes;
         const long g = (long) std::llround (t * job.fps);
         for (long f = packedFrame + 1; f <= g; ++f)
-            cachedNotes = packNotesAtBeat ((double) f / job.fps * job.bpm / 60.0);
+            cachedNotes = packNotesAtBeat (
+                job.beatTimeline.secondsToBeat((double) f / job.fps));
         if (g > packedFrame) packedFrame = g;
         return cachedNotes;
     };
@@ -1371,26 +1496,40 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
     // evaluateRouting branch, equals the modulation value combine() applies — so
     // stateAt reads st.smoothed and lays combine(mode, base, st.smoothed) over
     // each clip's resolved (static+baked) param. The beat is the ABSOLUTE
-    // timeline beat (t·bpm/60, == the packer), so score-sourced routings see the
+    // mapped timeline beat (== the packer), so score-sourced routings see the
     // same note onsets the packer does. Audio sources only have features inside
     // the export range (the mix WAV is range-scoped); before rangeStartSec their
     // Audio is zero-fed (matches a fresh analyzer). Empty routings ⇒ no work and
     // stateAt's loop is skipped ⇒ byte-identical to a no-modMatrix job.
     std::vector<arbitmod::RoutingState> routingStates (job.routings.size());
+    videocontrol::Executor controlExecutor;
+    std::string controlPlanError;
+    for (const auto& operation : job.controlPlan.operations)
+        if (operation.kind == "source" && operation.source.trackId >= 0
+            && (operation.source.type == arbitmod::SourceType::AudioRms
+                || operation.source.type == arbitmod::SourceType::AudioPeak
+                || operation.source.type == arbitmod::SourceType::AudioOnset
+                || operation.source.type == arbitmod::SourceType::AudioBand))
+            return "track/group audio source export requires a deterministic feature stream; "
+                   "live transport features cannot be substituted";
+    if (!controlExecutor.bind(job.controlPlan, controlPlanError))
+        return "video control plan admission failed: " + controlPlanError;
+    std::vector<videocontrol::SinkValue> controlSinkValues;
     long advancedRoutingFrame = -1;
     auto advanceRoutingsToFrame = [&] (double t)
     {
-        if (job.routings.empty()) return;
+        if (job.routings.empty() && controlExecutor.empty()) return;
         const long g = (long) std::llround (t * job.fps);
-        const double dtBeats = (1.0 / job.fps) * job.bpm / 60.0;   // constant per frame
         for (long f = advancedRoutingFrame + 1; f <= g; ++f)
         {
             const double ft   = (double) f / job.fps;              // timeline seconds
-            const double beat = ft * job.bpm / 60.0;               // absolute beat (== packer)
+            const auto frameClock = job.beatTimeline.clockAtSeconds(ft);
+            const double dtBeats = job.beatTimeline.secondsToBeat(ft + 1.0 / job.fps)
+                                  - frameClock.beat;
             arbitmod::Clock clk;
-            clk.beat        = (float) beat;
-            clk.bpm         = (float) job.bpm;
-            clk.beatsPerBar = (float) job.beatsPerBar;
+            clk.beat        = (float) frameClock.beat;
+            clk.bpm         = (float) frameClock.bpm;
+            clk.beatsPerBar = (float) frameClock.beatsPerBar;
             arbitmod::Audio aud;
             if (ft >= rangeStartSec)        // range-scoped features; pre-range = zero-fed
             {
@@ -1408,6 +1547,10 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
                 arbitmod::evaluateRouting (r, routingStates[ri], 0.0f,
                                            job.score, clk, aud, (float) dtBeats);
             }
+            const auto& sinks = controlExecutor.evaluate(
+                job.score, clk, aud, static_cast<float>(dtBeats),
+                static_cast<float>(1.0 / job.fps));
+            controlSinkValues.assign(sinks.begin(), sinks.end());
         }
         if (g > advancedRoutingFrame) advancedRoutingFrame = g;
     };
@@ -1430,14 +1573,14 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
     if (wantJs && ! job.jsScript.empty())
     {
         std::string err;
-        luaActive = jsHook.compile (job.jsScript, err);
+        luaActive = jsHook.compile (job.jsScript, err, job.scriptCpuMs, job.scriptMemoryMiB);
         if (! luaActive)
             std::fprintf (stderr, "[js] hook disabled: %s\n", err.c_str());
     }
     else if (! wantJs && ! job.luaScript.empty())
     {
         std::string err;
-        luaActive = luaHook.compile (job.luaScript, err);
+        luaActive = luaHook.compile (job.luaScript, err, job.scriptCpuMs, job.scriptMemoryMiB);
         if (! luaActive)
             std::fprintf (stderr, "[lua] hook disabled: %s\n", err.c_str());
     }
@@ -1464,9 +1607,10 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
             const double ft = (double) f / job.fps;
             arbitlua::FrameCtx ctx;
             ctx.t           = ft;
-            ctx.beat        = ft * job.bpm / 60.0;
-            ctx.bpm         = job.bpm;
-            ctx.beatsPerBar = job.beatsPerBar;
+            const auto frameClock = job.beatTimeline.clockAtSeconds(ft);
+            ctx.beat        = frameClock.beat;
+            ctx.bpm         = frameClock.bpm;
+            ctx.beatsPerBar = frameClock.beatsPerBar;
             ctx.frame       = f;
             ctx.rootFreq    = luaRootFreq;
             videorender::AudioFeatures vaf;      // zero-fed before the range start
@@ -1539,6 +1683,17 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
             if (! getGraphParam (s, node, param, base)) continue;
             applyGraphParam (s, node, param,
                              arbitmod::combine (r.mode, (float) base, routingStates[ri].smoothed));
+        }
+        for (const auto& sink : controlSinkValues)
+        {
+            if (!sink.enabled) continue;
+            int cid = 0; std::string node, param;
+            if (!parseClipParamId(sink.destination, cid, node, param) || cid != clipId)
+                continue;
+            double base = 0.0;
+            if (!getGraphParam(s, node, param, base)) continue;
+            applyGraphParam(s, node, param,
+                            arbitmod::combine(sink.mode, static_cast<float>(base), sink.value));
         }
         // M8: the Lua hook is the TOP layer — apply this frame's overrides for
         // this clip after static/baked/mod-matrix. luaOverrides is already
@@ -1653,6 +1808,7 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
         auto& cs = streams[seg.clipId];
         if (cs.path != seg.sourcePath)
         {
+            cs.depth.clear(glctx.renderer);
             cs.media.reset();
             cs.path = seg.sourcePath;
             cs.openFailed = false;
@@ -1677,21 +1833,20 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
 
         const double fps = std::max (cs.media->info().fps, 1.0);
 
-        // AI roto (Epic C): lazily open the clip's matte sequence as its own
-        // image-sequence MediaContext (matte_%06d.png, frame 1..N). Decoded per
+        // AI roto (Epic C): lazily open the clip's authority-named matte sequence.
         // frame at the clip's fit and multiplied into the clip alpha below.
         if (! seg.matteDir.empty() && cs.matteMedia == nullptr && ! cs.matteOpenFailed)
         {
             cs.matteMedia = std::make_unique<MediaContext>();
-            const std::string mpat = seg.matteDir + "/matte_%06d.png";
+            std::string validatedDir, mpat, matteError;
             const double mfps = seg.matteFps > 0.0 ? seg.matteFps : fps;
-            if (! cs.matteMedia->open (mpat, false, mfps, 1).empty())
+            if (! videowire::revalidateMatteForOpen(seg, validatedDir, mpat, matteError)
+                || ! cs.matteMedia->open(mpat, false, mfps, seg.matteFirstFrame).empty())
             {
                 cs.matteMedia.reset();
                 cs.matteOpenFailed = true;
             }
         }
-
         // Retime ladder — gated on the per-clip tier so the export reproduces the
         // exact interpolation the live preview showed (audit #2/#5/#9/#10). The
         // trigger (rate < 0.999) is identical to the viewport's (viewport.cpp:
@@ -1798,7 +1953,8 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
             if (cs.media->getFrame (srcSec, vEnc->width, vEnc->height, df).empty()
                 && df.width > 0)
             {
-                if (cs.matteMedia != nullptr)            // AI roto: isolate the subject
+                if (cs.matteMedia != nullptr
+                    && ! videowire::visualPlanUsesTypedMatte(job.visualLayerPlans, seg.clipId))
                     applyAlphaMatte (df, *cs.matteMedia, srcSec);
                 cs.tex = glctx.renderer.uploadRgba (df.rgba.data(), df.width, df.height,
                                                     df.strideBytes, cs.tex);
@@ -1809,6 +1965,56 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
             }
         }
         return cs.texW > 0 ? &cs : nullptr;
+    };
+
+    auto uploadTypedMatte = [&] (const ExportSegment& segment, ExportClipStream& stream,
+                                 double sourceSec) -> bool
+    {
+        if (! videowire::visualPlanUsesTypedMatte(job.visualLayerPlans, segment.clipId)) return true;
+        if (stream.matteMedia == nullptr) return false;
+        videowire::RenderSegment secondary;
+        const bool combined = videowire::visualPlanSecondaryMatte(
+            job.visualLayerPlans, segment.clipId, segment, secondary);
+        if (combined && stream.matteReceiptB != secondary.matteContentReceipt)
+        {
+            glctx.renderer.deleteTexture(stream.matteTexB); stream.matteTexB = 0;
+            stream.matteMediaB.reset(); stream.matteOpenFailedB = false;
+            stream.matteTexWB = stream.matteTexHB = 0;
+            stream.matteReceiptB = secondary.matteContentReceipt;
+        }
+        if (combined && stream.matteMediaB == nullptr && !stream.matteOpenFailedB)
+        {
+            std::string dir, pattern, matteError;
+            stream.matteMediaB = std::make_unique<MediaContext>();
+            if (!videowire::revalidateMatteForOpen(secondary, dir, pattern, matteError)
+                || !stream.matteMediaB->open(pattern, false, secondary.matteFps,
+                                             secondary.matteFirstFrame).empty())
+            { stream.matteMediaB.reset(); stream.matteOpenFailedB = true; }
+        }
+        if (combined && stream.matteMediaB == nullptr) return false;
+        const double fps = segment.matteFps > 0.0 ? segment.matteFps : 1.0;
+        if (stream.matteTexW == 0 || std::abs(sourceSec - stream.matteLastSrcSec) >= 0.5 / fps)
+        {
+            DecodedFrame frame;
+            if (!stream.matteMedia->getFrame(sourceSec, stream.texW, stream.texH, frame).empty()
+                || frame.width <= 0 || frame.height <= 0 || frame.rgba.empty()) return false;
+            stream.matteTex = glctx.renderer.uploadRgba(frame.rgba.data(), frame.width, frame.height,
+                                                        frame.strideBytes, stream.matteTex);
+            stream.matteTexW = frame.width; stream.matteTexH = frame.height;
+            stream.matteLastSrcSec = frame.ptsSec;
+        }
+        if (combined && (stream.matteTexWB == 0
+            || std::abs(sourceSec - stream.matteLastSrcSecB) >= 0.5 / secondary.matteFps))
+        {
+            DecodedFrame frame;
+            if (!stream.matteMediaB->getFrame(sourceSec, stream.texW, stream.texH, frame).empty()
+                || frame.width <= 0 || frame.height <= 0 || frame.rgba.empty()) return false;
+            stream.matteTexB = glctx.renderer.uploadRgba(frame.rgba.data(), frame.width, frame.height,
+                                                         frame.strideBytes, stream.matteTexB);
+            stream.matteTexWB = frame.width; stream.matteTexHB = frame.height;
+            stream.matteLastSrcSecB = frame.ptsSec;
+        }
+        return stream.matteTex != 0 && (!combined || stream.matteTexB != 0);
     };
 
     // cs == nullptr + shaderClock set ⇒ a shader-generator layer (no decoded
@@ -1906,18 +2112,22 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
 
     // RGBA (renderer output) -> encoder pixel format, full frame
     // (yuv420p for h264/h265/vp9, yuv422p10le for prores).
-    SwsContext* sws = sws_getContext (vEnc->width, vEnc->height, AV_PIX_FMT_RGBA,
-                                      vEnc->width, vEnc->height, vEnc->pix_fmt,
-                                      SWS_BILINEAR, nullptr, nullptr, nullptr);
-    if (sws == nullptr)
-        return "sws_getContext (RGBA->encoder) failed";
-    setSws709 (sws);
-
-    AVFrame* frame = av_frame_alloc();
-    frame->format = vEnc->pix_fmt;
-    frame->width = vEnc->width;
-    frame->height = vEnc->height;
-    av_frame_get_buffer (frame, 0);
+    SwsContext* sws = nullptr;
+    AVFrame* frame = nullptr;
+    if (capturedPixels == nullptr)
+    {
+        sws = sws_getContext (vEnc->width, vEnc->height, AV_PIX_FMT_RGBA,
+                              vEnc->width, vEnc->height, vEnc->pix_fmt,
+                              SWS_BILINEAR, nullptr, nullptr, nullptr);
+        if (sws == nullptr)
+            return "sws_getContext (RGBA->encoder) failed";
+        setSws709 (sws);
+        frame = av_frame_alloc();
+        frame->format = vEnc->pix_fmt;
+        frame->width = vEnc->width;
+        frame->height = vEnc->height;
+        av_frame_get_buffer (frame, 0);
+    }
 
     glctx.renderer.setOutputSize (vEnc->width, vEnc->height);
     glctx.renderer.setBackgroundColor (job.bgColor[0], job.bgColor[1],   // M1 canvas background
@@ -2004,24 +2214,12 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
                 al.transitionProgress = std::clamp (
                     (t - s.displayStartSec) / s.transitionDurationSec, 0.0, 1.0);
 
-                // A = previous segment on the same trackLayer when it
-                // abuts/overlaps; otherwise A stays empty (= black).
-                const ExportSegment* best = nullptr;
-                for (const auto& c : job.segments)
-                    if (&c != &s && c.trackLayer == s.trackLayer
-                        && c.displayStartSec < s.displayStartSec
-                        && (best == nullptr
-                            || c.displayStartSec > best->displayStartSec))
-                        best = &c;
+                const ExportSegment* best =
+                    videowire::resolveTransitionFrom (job.segments, s, kAbutEps);
                 if (best != nullptr)
                 {
-                    const double bestDur =
-                        (best->outSec - best->inSec) / std::max (best->rate, 1e-9);
-                    if (best->displayStartSec + bestDur >= s.displayStartSec - kAbutEps)
-                    {
-                        al.fromSeg = best;
-                        al.fromParams = stateAt (best->clipId, t);
-                    }
+                    al.fromSeg = best;
+                    al.fromParams = stateAt (best->clipId, t);
                 }
             }
             act.push_back (std::move (al));
@@ -2067,14 +2265,50 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
         const videorender::NoteFeatures* frameNotes =
             haveScore ? &notesForFrame (t) : nullptr;
 
+        auto prepareDecodedDesc = [&] (const ExportSegment& segment,
+                                       const ClipRenderState& params,
+                                       double sourceSec,
+                                       videorender::LayerDesc& desc) -> bool
+        {
+            ExportClipStream* stream = decodeLayer(segment, sourceSec);
+            if (stream == nullptr) return false;
+            fillDesc(desc, params, stream, t, segment.clipId, nullptr, nullptr, nullptr);
+            if (! uploadTypedMatte(segment, *stream, sourceSec))
+            {
+                error = "typed matte asset frame is unavailable";
+                return false;
+            }
+            desc.matteTexture = stream->matteTex;
+            desc.matteWidth = stream->matteTexW;
+            desc.matteHeight = stream->matteTexH;
+            desc.matteTextureB = stream->matteTexB;
+            desc.matteWidthB = stream->matteTexWB;
+            desc.matteHeightB = stream->matteTexHB;
+            if (! videohelper::prepareDepthTexture(job.depthCacheRoot,
+                    job.visualLayerPlans, segment.clipId, sourceSec, 1,
+                    glctx.renderer, stream->depth, desc, error))
+                return false;
+            if (! videohelper::trackingruntime::prepareTracking(job.depthCacheRoot,
+                    job.visualLayerPlans, segment.clipId, sourceSec, desc, error))
+                return false;
+            return videowire::executeVisualLayerPlan(
+                job.visualLayerPlans, segment.clipId, desc, error,
+                nullptr, nullptr, &visualPlanState, t,
+                &job.visualEventSchedules, &visualEventCursor);
+        };
+
         for (const auto& al : act)
         {
             if (al.params.visible < 0.5f || al.params.opacity <= 0.001f)
                 continue;
 
             videorender::LayerDesc d;
+            bool planExecuted = false;
+            const auto sourceKind = videowire::resolveSourceKind (
+                al.seg->sourceKind, al.seg->isAdjustment, al.seg->sourcePath);
 
-            if (shaderClips.count (al.seg->clipId) > 0)
+            if (sourceKind == videowire::SourceKind::Shader
+                && shaderClips.count (al.seg->clipId) > 0)
             {
                 // Shader-generator clip: no media decode; the clock is a pure
                 // function of display time + tempo (== the viewport's formula).
@@ -2083,7 +2317,7 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
                 const int frameIdx = (int) std::llround (
                     (t - al.seg->displayStartSec) * job.fps);
                 const videorender::ShaderClock clock = videorender::makeShaderClock (
-                    t, al.seg->displayStartSec, segDur, job.bpm, job.beatsPerBar,
+                    t, al.seg->displayStartSec, segDur, job.beatTimeline,
                     job.fps, true, frameIdx);
                 // Block B (M4): the mix WAV is range-scoped (sample 0 ==
                 // rangeStartSec), so sample its features at buffer-relative time.
@@ -2092,7 +2326,7 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
                           af.bands.empty() ? nullptr : &af,
                           frameNotes);   // Block C (M5)
             }
-            else if (particleClips.count (al.seg->clipId) > 0)
+            else if (sourceKind == videowire::SourceKind::Particles)
             {
                 // P4 particle clip: no decode; the compute pool is driven by the
                 // SAME clock formula as the viewport, and the packed score
@@ -2102,13 +2336,13 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
                 const int frameIdx = (int) std::llround (
                     (t - al.seg->displayStartSec) * job.fps);
                 const videorender::ShaderClock clock = videorender::makeShaderClock (
-                    t, al.seg->displayStartSec, segDur, job.bpm, job.beatsPerBar,
+                    t, al.seg->displayStartSec, segDur, job.beatTimeline,
                     job.fps, true, frameIdx);
                 fillDesc (d, al.params, nullptr, t, al.seg->clipId, &clock,
                           nullptr, frameNotes, /*isAdjustment=*/false,
                           /*particleSource=*/true);
             }
-            else if (adjustmentClips.count (al.seg->clipId) > 0)
+            else if (sourceKind == videowire::SourceKind::Adjustment)
             {
                 // M8 adjustment clip: no decode, no shader — its effects rack
                 // runs over the composite beneath it in renderComposite.
@@ -2119,11 +2353,19 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
             {
                 const double srcSec = al.seg->inSec
                     + (t - al.seg->displayStartSec) * al.seg->rate;
-                ExportClipStream* cs = decodeLayer (*al.seg, srcSec);
-                if (cs == nullptr)
+                if (! prepareDecodedDesc(*al.seg, al.params, srcSec, d))
+                {
+                    if (! error.empty()) break;
                     continue;
-                fillDesc (d, al.params, cs, t, al.seg->clipId, nullptr, nullptr, nullptr);
+                }
+                planExecuted = true;
             }
+
+            if (! planExecuted && ! videowire::executeVisualLayerPlan (
+                    job.visualLayerPlans, al.seg->clipId, d, error,
+                    nullptr, nullptr, &visualPlanState, t,
+                    &job.visualEventSchedules, &visualEventCursor))
+                break;
 
             if (al.transitionActive)
             {
@@ -2136,13 +2378,13 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
                         + (t - al.fromSeg->displayStartSec) * al.fromSeg->rate;
                     fromSrc = std::clamp (fromSrc, al.fromSeg->inSec,
                                           std::max (al.fromSeg->inSec, al.fromSeg->outSec));
-                    if (ExportClipStream* fs = decodeLayer (*al.fromSeg, fromSrc))
+                    videorender::LayerDesc fd;
+                    if (prepareDecodedDesc(*al.fromSeg, al.fromParams, fromSrc, fd))
                     {
-                        videorender::LayerDesc fd;
-                        fillDesc (fd, al.fromParams, fs, t, al.fromSeg->clipId, nullptr, nullptr, nullptr);
                         fromDescs.push_back (fd);
                         d.fromLayer = &fromDescs.back();
                     }
+                    else if (! error.empty()) break;
                 }
             }
             descs.push_back (d);
@@ -2207,9 +2449,11 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
         {
             if (wantsAbort (progress)) { error = "cancelled"; break; }
             buildFrame (warmStart + (double) w / job.fps);
-            glctx.renderer.renderComposite (descs.data(), (int) descs.size(),
-                                            overlays.empty() ? nullptr : overlays.data(),
-                                            (int) overlays.size());
+            if (! error.empty()) break;
+            if (! glctx.renderWarmup (descs.data(), (int) descs.size(),
+                                      overlays.empty() ? nullptr : overlays.data(),
+                                      (int) overlays.size()))
+                error = "native compositor feedback pre-roll failed";
         }
     }
 
@@ -2221,17 +2465,34 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
             break;
         }
         buildFrame (rangeStartSec + (double) n / job.fps);
+        if (! error.empty()) break;
 
         // Pipelined readback: this call kicks off frame n's GPU readback and
         // hands back frame n-1's pixels, so encode overlaps the next render.
         bool havePrev = false;
-        if (! glctx.renderer.renderToPixelsAsync (descs.data(), (int) descs.size(),
-                                                  rgba, havePrev, error,
-                                                  overlays.empty() ? nullptr : overlays.data(),
-                                                  (int) overlays.size()))
+        const auto renderCall = [&] { return glctx.renderNext (descs.data(), (int) descs.size(),
+                                rgba, havePrev, error,
+                                overlays.empty() ? nullptr : overlays.data(),
+                                (int) overlays.size()); };
+        const bool renderOk = telemetryOwner != nullptr
+            ? telemetryOwner->renderComposite(renderCall, [] (bool valid) { return valid; })
+            : renderCall();
+        if (! renderOk)
             break;
+        if (havePrev && telemetryOwner != nullptr
+            && ! telemetryOwner->observeFrame(vEnc->width, vEnc->height,
+                                               static_cast<uint64_t>(vEnc->width) * 4,
+                                               rgba.size()))
+        {
+            error = telemetryOwner->lastFrameFailure() == videowire::VisualDropReason::dimensionMismatch
+                ? "native compositor output dimension mismatch"
+                : "native compositor readback byte mismatch";
+            break;
+        }
 
-        if (havePrev)
+        if (havePrev && capturedPixels != nullptr)
+            *capturedPixels = rgba;
+        else if (havePrev)
         {
             if (av_frame_make_writable (frame) < 0)
             {
@@ -2243,36 +2504,75 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
             sws_scale (sws, srcData, srcStride, 0, vEnc->height, frame->data, frame->linesize);
 
             frame->pts = encodedFrames++;
-            error = encodeAndWrite (fmt, vStream, vEnc, frame);
+            if (telemetryOwner != nullptr)
+            {
+                std::string handoffError;
+                telemetryOwner->encodedHandoff(rgba.size(), [&] {
+                    handoffError = encodeAndWrite(fmt, vStream, vEnc, frame);
+                    return handoffError.empty();
+                });
+                error = handoffError;
+            }
+            else
+                error = encodeAndWrite (fmt, vStream, vEnc, frame);
         }
         fpsClock.update (progress, n + 1);
     }
 
     // The pipeline lags by one frame: collect and encode the final readback.
-    if (error.empty() && glctx.renderer.drainAsyncReadback (rgba))
+    if (error.empty() && glctx.drain (rgba))
     {
-        if (av_frame_make_writable (frame) < 0)
+        if (capturedPixels != nullptr)
+            *capturedPixels = rgba;
+        else if (av_frame_make_writable (frame) < 0)
             error = "frame not writable";
         else
         {
-            const uint8_t* srcData[1] = { rgba.data() };
-            const int srcStride[1] = { vEnc->width * 4 };
-            sws_scale (sws, srcData, srcStride, 0, vEnc->height, frame->data, frame->linesize);
-            frame->pts = encodedFrames++;
-            error = encodeAndWrite (fmt, vStream, vEnc, frame);
+            if (telemetryOwner != nullptr
+                && ! telemetryOwner->observeFrame(vEnc->width, vEnc->height,
+                                                   static_cast<uint64_t>(vEnc->width) * 4,
+                                                   rgba.size()))
+                error = telemetryOwner->lastFrameFailure() == videowire::VisualDropReason::dimensionMismatch
+                    ? "native compositor output dimension mismatch"
+                    : "native compositor readback byte mismatch";
+            if (error.empty())
+            {
+                const uint8_t* srcData[1] = { rgba.data() };
+                const int srcStride[1] = { vEnc->width * 4 };
+                sws_scale (sws, srcData, srcStride, 0, vEnc->height, frame->data, frame->linesize);
+                frame->pts = encodedFrames++;
+                if (telemetryOwner != nullptr)
+                {
+                    std::string handoffError;
+                    telemetryOwner->encodedHandoff(rgba.size(), [&] {
+                        handoffError = encodeAndWrite(fmt, vStream, vEnc, frame);
+                        return handoffError.empty();
+                    });
+                    error = handoffError;
+                }
+                else
+                    error = encodeAndWrite (fmt, vStream, vEnc, frame);
+            }
         }
     }
 
     for (auto& [clipId, cs] : streams)
+    {
         glctx.renderer.deleteTexture (cs.tex);
+        glctx.renderer.deleteTexture (cs.texA);
+        glctx.renderer.deleteTexture (cs.texB);
+        glctx.renderer.deleteTexture (cs.matteTex);
+        glctx.renderer.deleteTexture (cs.matteTexB);
+        cs.depth.clear(glctx.renderer);
+    }
     for (auto& tl : textLayers)
         glctx.renderer.deleteTexture (tl.tex);
     for (auto& [clipId, l] : clipLuts)
         glctx.renderer.deleteTexture (l.tex);
     for (int clipId : shaderClips)
         glctx.renderer.clearClipShader (clipId);
-    sws_freeContext (sws);
-    av_frame_free (&frame);
+    if (sws != nullptr) sws_freeContext (sws);
+    if (frame != nullptr) av_frame_free (&frame);
     return error;
 }
 
@@ -2301,6 +2601,65 @@ std::vector<arbitblockb::FeatureFrame> analyzeMixWavOffline (const std::string& 
 } // namespace videohelper
 #endif // ARBIT_HAVE_VIEWPORT
 
+std::string renderCompositeFrame (const ExportJob& input, double timelineSec,
+                                  CompositeFrameResult& result)
+{
+#if ! ARBIT_HAVE_VIEWPORT
+    (void) input; (void) timelineSec; (void) result;
+    return "helper built without production viewport compositor support";
+#else
+    if (! std::isfinite (timelineSec) || timelineSec < 0.0)
+        return "timelineSec must be finite and non-negative";
+    if (input.width < 1 || input.height < 1 || input.fps <= 0.0)
+        return "invalid fps/width/height";
+
+    ExportJob job = input;
+    job.startSec = timelineSec;
+    job.endSec = timelineSec + 1.0 / job.fps;
+    job.durationSec = job.endSec;
+
+    // Match export's fail-fast source admission before creating the GPU context.
+    for (const auto& segment : job.segments)
+    {
+        if (isNonMediaSource (segment)) continue;
+        MediaContext probe;
+        if (auto error = probe.open (segment.sourcePath, false,
+                                     segment.sourceFps, segment.seqStart);
+            ! error.empty())
+            return error;
+    }
+
+    GlExportContext context;
+    std::string error;
+    if (! context.init (job.width, job.height, error))
+        return "native GPU composite probe unavailable: " + error;
+
+    AVCodecContext dimensions {};
+    dimensions.width = job.width;
+    dimensions.height = job.height;
+    dimensions.pix_fmt = AV_PIX_FMT_RGBA;
+    result.rgba.clear();
+    error = runGlFrameLoop (job, context, nullptr, nullptr, &dimensions,
+                            timelineSec, 1.0 / job.fps, nullptr, nullptr,
+                            nullptr, &result.rgba);
+    result.width = job.width;
+    result.height = job.height;
+    result.compositorBackend = context.renderer.compositorBackend();
+#if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
+    if (result.compositorBackend.rfind ("metal", 0) != 0)
+        error = "strict Metal composite probe did not use the native Metal compositor";
+    result.presentationBackend = "metal-iosurface-cpu-readback";
+#else
+    result.presentationBackend = "opengl-offscreen-async-readback";
+#endif
+    context.shutdown();
+    if (error.empty() && result.rgba.size()
+            != static_cast<size_t> (result.width) * result.height * 4)
+        error = "production compositor returned an incomplete frame";
+    return error;
+#endif
+}
+
 // ------------------------------------------------------------------ export
 
 std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
@@ -2309,6 +2668,20 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
                        ExportProgress* progress)
 {
     glCompositingOut = false;
+
+    // A transported compiled plan is a strict native execution contract. Admit
+    // the whole immutable set before opening output resources; unsupported DAGs
+    // must not reach the legacy CPU painter. This also enforces fixed-slot capacity.
+    videowire::VisualPlanExecutionState exportAdmission;
+    if (progress != nullptr)
+        exportAdmission.setTelemetryOwner(progress->visualTelemetry);
+    std::string planDiagnostic;
+    if (! exportAdmission.admitPlans(job.visualLayerPlans, &planDiagnostic))
+        return planDiagnostic;
+#if ! ARBIT_HAVE_VIEWPORT
+    if (! job.visualLayerPlans.empty())
+        return "compiled visual layer plans require the native GPU compositor";
+#endif
 
     // audit #6: refuse minterpolate when it would silently drop GL-composited
     // content (see minterpolateWouldDropContent). Everything downstream selects
@@ -2365,7 +2738,7 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
         // regular media (every segment of one path shares the clip's hints).
         std::map<std::string, std::pair<double, int>> uniquePaths;
         for (const auto& s : job.segments)
-            if (! isGeneratorPath (s.sourcePath))   // generators have no media to probe
+            if (! isNonMediaSource (s))   // generated/adjustment sources have no media to probe
                 uniquePaths.emplace (s.sourcePath, std::make_pair (s.sourceFps, s.seqStart));
         for (const auto& [p, hint] : uniquePaths)
         {
@@ -2396,7 +2769,7 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
         bool tierTrigger = false;
         for (const auto& s : job.segments)
         {
-            if (isGeneratorPath (s.sourcePath)) continue;  // generators emit every frame
+            if (isNonMediaSource (s)) continue;  // generated/adjustment sources emit every frame
             if (std::max (sourceFps[s.sourcePath], 1.0) * s.rate < job.fps * 0.999)
                 jobTrigger = true;
             if (s.retimeQuality >= 2 && s.rate < 0.999)
@@ -2459,6 +2832,7 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
     const bool prores4444 = encName == "prores_ks"
         && (job.proresProfile == "4444" || job.proresProfile == "4444xq");
     vEnc->pix_fmt = isDpx                  ? AV_PIX_FMT_GBRP10LE       // 10-bit RGB DPX
+                  : encName == "ffv1"      ? AV_PIX_FMT_BGRA          // lossless; FFV1 does not admit RGBA
                   : encName != "prores_ks" ? AV_PIX_FMT_YUV420P
                   : prores4444             ? AV_PIX_FMT_YUV444P10LE   // 4444 / 4444 XQ
                                            : AV_PIX_FMT_YUV422P10LE;  // 422 HQ
@@ -2484,7 +2858,7 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
                                                          : "3"; // 422 HQ (default)
         av_opt_set (vEnc->priv_data, "profile", prof, 0);
     }
-    else
+    else if (encName != "ffv1")
         vEnc->bit_rate = (int64_t) job.width * job.height * 8; // ~16 Mbps at 1080p
 
     tagColorBt709 (vEnc);
@@ -2604,11 +2978,12 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
         return err;
     };
 
-    // ---- GL composited path (export parity with the live viewport). The
+    // ---- GPU-composited path (export parity with the live viewport). The
     // minterpolate path keeps the legacy per-segment filter graph (motion
     // interpolation needs the raw retimed source stream, not composited
-    // output); headless / GL failure falls back too — never crash, just
-    // report glCompositing = false.
+    // output). On macOS the strict Metal renderer is required: a failed native
+    // initialization is an export error, never permission to silently omit
+    // effects or generators through the legacy CPU painter.
     bool glDone = false;
 #if ARBIT_HAVE_VIEWPORT
     if (error.empty() && effInterp != "minterpolate")
@@ -2617,9 +2992,14 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
         std::string glErr;
         if (glctx.init (vEnc->width, vEnc->height, glErr))
         {
+            const auto backend = glctx.renderer.compositorBackend().rfind("metal", 0) == 0
+                ? videowire::VisualBackend::metal : videowire::VisualBackend::openGL;
+            videowire::ExportTelemetryOwner<> telemetryOwner(
+                exportAdmission.telemetry(), backend, job.width, job.height);
+            glctx.renderer.setVisualTelemetryOwner(&telemetryOwner.telemetry());
 #if ARBIT_HAVE_ONNX
             error = runGlFrameLoop (job, glctx, fmt, vStream, vEnc, rangeStart,
-                                    durationSec, rife.get(), progress);
+                                    durationSec, rife.get(), progress, &telemetryOwner);
             if (error.empty() && rife != nullptr)
             {
                 interpolationBackendOut = rife->backend();
@@ -2634,17 +3014,32 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
             }
 #else
             error = runGlFrameLoop (job, glctx, fmt, vStream, vEnc, rangeStart,
-                                    durationSec, nullptr, progress);
+                                    durationSec, nullptr, progress, &telemetryOwner);
 #endif
             glctx.shutdown();
             glDone = true;
             glCompositingOut = error.empty();
         }
         else
-            std::fprintf (stderr,
-                          "[export] GL compositing unavailable (%s) — CPU "
-                          "fallback, effects/compositing skipped\n",
-                          glErr.c_str());
+        {
+            if (! job.visualLayerPlans.empty())
+            {
+                error = "native GPU visual plan compositor unavailable: " + glErr;
+                glDone = true;
+            }
+            else
+            {
+#if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
+                error = "native Metal export compositor unavailable: " + glErr;
+                glDone = true;
+#else
+                std::fprintf (stderr,
+                              "[export] GL compositing unavailable (%s) — CPU "
+                              "fallback, effects/compositing skipped\n",
+                              glErr.c_str());
+#endif
+            }
+        }
     }
 #endif
 
@@ -2654,7 +3049,7 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
     if (error.empty() && ! glDone)
         for (const auto& s : job.segments)
         {
-            if (isGeneratorPath (s.sourcePath)) continue;  // no-GL path can't render generators
+            if (isNonMediaSource (s)) continue;  // no-GL path can't render generated sources
             if (sources.count (s.sourcePath)) continue;
             auto ctx = std::make_unique<MediaContext>();
             error = ctx->open (s.sourcePath, true, s.sourceFps, s.seqStart);
@@ -2695,7 +3090,7 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
         {
             if (! error.empty())
                 break;
-            if (isGeneratorPath (seg.sourcePath))
+            if (isNonMediaSource (seg))
                 continue;   // no-GL minterpolate path cannot render a generator
 
             // Skip segments entirely outside the export range.
@@ -2838,7 +3233,7 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
         }
 
         DecodedFrame df; // empty = black frame
-        if (seg != nullptr && ! isGeneratorPath (seg->sourcePath))
+        if (seg != nullptr && ! isNonMediaSource (*seg))
         {
             const double srcSec = seg->inSec + (t - seg->displayStartSec) * seg->rate;
             DecodedFrame decoded;
@@ -2858,7 +3253,11 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
     }
 
     if (error.empty() && headerWritten && av_write_trailer (fmt) < 0)
+    {
+        if (progress != nullptr)
+            progress->visualTelemetry.recordDrop(videowire::VisualDropReason::transportFailure);
         error = "write_trailer failed";
+    }
 
     sws_freeContext (sws);
     if (work != frame)

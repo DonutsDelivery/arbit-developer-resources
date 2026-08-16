@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # pyright: reportOptionalSubscript=false, reportOptionalMemberAccess=false, reportArgumentType=false
 import json
+import os
 import struct
 import subprocess
+import tempfile
 import uuid
 from multiprocessing import shared_memory
 
@@ -25,7 +27,10 @@ class FrameRing:
         size = ALIGN + slots * self.slot_stride
         self.name = "arbtest-" + uuid.uuid4().hex[:12]
         self.shm = shared_memory.SharedMemory(name=self.name, create=True, size=size)
-        self.shm.buf[:] = b"\0" * size
+        # Python 3.14 on macOS exposes the page-rounded mapping through buf,
+        # which can be larger than the logical size requested above. Clear only
+        # the protocol-owned extent so both sides of the assignment match.
+        self.shm.buf[:size] = b"\0" * size
         struct.pack_into("<8I", self.shm.buf, 0, MAGIC, VERSION, slots,
                          self.slot_bytes, self.slot_stride, 0, 0, 0)
 
@@ -49,9 +54,30 @@ class FrameRing:
 
 class RpcHelper:
     def __init__(self, executable):
-        self.process = subprocess.Popen([executable], stdin=subprocess.PIPE,
+        self.matte_cache = tempfile.TemporaryDirectory(prefix="arbit-matte-cache-")
+        self.depth_cache = tempfile.TemporaryDirectory(prefix="arbit-depth-cache-")
+        secret_read, secret_write = os.pipe()
+        session_packet = os.urandom(32) + struct.pack(">Q", 1)
+        try:
+            saved_fd3 = os.dup(3)
+        except OSError:
+            saved_fd3 = None
+        if secret_read != 3:
+            os.dup2(secret_read, 3)
+            os.close(secret_read)
+        self.process = subprocess.Popen([executable, "--matte-cache-root", self.matte_cache.name,
+                                         "--depth-cache-root", self.depth_cache.name], stdin=subprocess.PIPE,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                        text=True, bufsize=1)
+                                        text=True, bufsize=1, pass_fds=(3,))
+        if saved_fd3 is None:
+            os.close(3)
+        else:
+            os.dup2(saved_fd3, 3)
+            os.close(saved_fd3)
+        try:
+            os.write(secret_write, session_packet)
+        finally:
+            os.close(secret_write)
         self.next_id = 1
 
     def call(self, method, params=None):
@@ -83,3 +109,5 @@ class RpcHelper:
             except Exception:
                 self.process.terminate()
         self.process.wait(timeout=10)
+        self.matte_cache.cleanup()
+        self.depth_cache.cleanup()

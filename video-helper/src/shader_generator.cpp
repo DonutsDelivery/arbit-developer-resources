@@ -26,25 +26,25 @@ void main() { gl_Position = vec4(aPos, 0.0, 1.0); }
 static const float kGenQuad[8] = { -1.f, -1.f,  1.f, -1.f,  -1.f, 1.f,  1.f, 1.f };
 
 ShaderClock makeShaderClock (double displaySec, double clipStartSec,
-                             double clipDurationSec, double bpm,
-                             double beatsPerBar, double fps,
+                             double clipDurationSec,
+                             const videotime::BeatTimeline& timeline, double fps,
                              bool playing, int frame)
 {
     ShaderClock c;
     const double clipRel = displaySec - clipStartSec;
+    const auto timelineClock = timeline.clockAtSeconds (displaySec);
+    const double clipStartBeat = timeline.secondsToBeat (clipStartSec);
+    const double clipEndBeat = timeline.secondsToBeat (clipStartSec + clipDurationSec);
     c.timeSec     = clipRel > 0.0 ? clipRel : 0.0;
     c.timeDelta   = fps > 1e-6 ? 1.0 / fps : 1.0 / 30.0;
     c.frame       = frame;
-    c.bpm         = bpm;
-    c.beatsPerBar = beatsPerBar > 1e-6 ? beatsPerBar : 4.0;
-    // Timeline-absolute beat (constant tempo, v1): beat-synced shaders lock to
-    // the song's grid wherever the clip sits.
-    c.beat        = displaySec * bpm / 60.0;
+    c.bpm         = timelineClock.bpm;
+    c.beatsPerBar = timelineClock.beatsPerBar;
+    c.beat        = timelineClock.beat;
     c.beatPhase   = c.beat - std::floor (c.beat);
-    const double bars = c.beat / c.beatsPerBar;
-    c.barPhase    = bars - std::floor (bars);
-    c.clipBeat    = c.timeSec * bpm / 60.0;
-    c.clipLength  = clipDurationSec * bpm / 60.0;
+    c.barPhase    = timelineClock.barPhase;
+    c.clipBeat    = std::max (0.0, c.beat - clipStartBeat);
+    c.clipLength  = std::max (0.0, clipEndBeat - clipStartBeat);
     c.playing     = playing;
     return c;
 }

@@ -12,13 +12,21 @@
 #include "media.h"
 #include "capture_device.h"
 #include "exporter.h"
+#include "composite_probe_contract.h"
+#include "bounded_line.h"
+#include "compositor_ownership.h"
+#include "render_snapshot_json.h"
 #if ARBIT_HAVE_VIEWPORT
 #include "viewport.h"
 #endif
+#include "visual_plan_telemetry_json.h"
 #include "shader_dialect.h"   // shader_compile RPC (GL-free dialect front door)
 #include "shader_compile/shader_lang.h"   // P3: Slang/SPIR-V → GLSL front door
+#include "gpu_backend/backend.h"          // P6: native Metal backend seam
 #include "lua_hook.h"         // P2 Scripts tab: script_compile validation (Lua hook)
 #include "js_hook.h"          // P2 Scripts tab: script_compile validation (JS hook)
+#include "programmable_admission.h"
+#include "../../shared/PrivateInheritedPayload.h"
 #include "VideoFrameSharedMemory.h"
 
 // rife_selftest RPC: exercises whichever RIFE backend is actually compiled in,
@@ -38,15 +46,26 @@ namespace arbitselftest { using RifeBackend = arbitrife::RifeEngine; }
 #include <cstdio>
 #include <iostream>
 
+#if defined(__APPLE__)
+#include <poll.h>
+#include <unistd.h>
+#endif
+#if ! defined(_WIN32) && ! defined(__APPLE__)
+#include <unistd.h>
+#endif
+
 #if defined(_WIN32)
 #include <io.h>
 #include <fcntl.h>
 #endif
 #include <atomic>
+#include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -59,6 +78,8 @@ std::map<uint32_t, std::unique_ptr<MediaContext>> g_media;
 uint32_t g_nextMediaId = 1;
 videoshm::Region g_shm;
 uint32_t g_nextSlot = 0;
+std::filesystem::path g_trustedMatteCacheRoot;
+std::filesystem::path g_trustedDepthCacheRoot;
 
 // Recorder sessions are independent: each owns the Arbit-provided shared-memory
 // ring and its encoder. A close/cancel moves one entry out of the map before
@@ -117,6 +138,9 @@ void cancelAllRecorderSessions()
 }
 #if ARBIT_HAVE_VIEWPORT
 Viewport g_viewport;
+bool g_testRejectNextSnapshot = false;
+bool g_testDeferNextSnapshot = false;
+std::optional<videowire::ResolvedVisualSnapshot> g_testDeferredSnapshot;
 
 // RAII: suspend viewport RIFE for the lifetime of an export/render-cache job (a
 // second GPU session would contend for VRAM) and ALWAYS restore on scope exit —
@@ -190,6 +214,7 @@ struct RenderCacheAsyncState
     std::mutex workerMutex;                 // guards join() callers
     std::thread worker;
 } g_renderCache;
+videohelper::CompositorOwnershipGate g_compositorOwnership;
 
 void reply (const json& idVal, const json& result)
 {
@@ -219,7 +244,7 @@ MediaContext* findMedia (const json& params, std::string& error)
 // jobSpec schema (PROTOCOL.md §Export):
 //   outPath: string (codec "prores" requires a .mov path)
 //   fps, width, height: numbers
-//   codec: "h264" | "h265" | "vp9" | "prores"
+//   codec: "h264" | "h265" | "vp9" | "prores" | "ffv1"
 //   encoder: "auto" | "software" | "nvenc" | "videotoolbox"
 //     (auto = try hardware encode, fall back to software; prores/vp9 are
 //     always software: prores_ks / libvpx-vp9)
@@ -416,6 +441,153 @@ static void parseRoutingsJson (const json& arr, std::vector<arbitmod::Routing>& 
     }
 }
 
+static bool parseVideoControlPlanJson(const json& value, videocontrol::Plan& plan,
+                                      std::string& error)
+{
+    plan = {};
+    if (value.is_null()) return true;
+    if (!value.is_object())
+    {
+        error = "controlPlan must be an object";
+        return false;
+    }
+    plan.version = value.value("version", 1);
+    plan.numSlots = value.value("numSlots", 0);
+    if (!value.contains("operations") || !value["operations"].is_array())
+    {
+        error = "controlPlan.operations must be an array";
+        return false;
+    }
+    if (value["operations"].size() > videocontrol::kMaxOperations)
+    {
+        error = "video control plan operation count exceeds capacity";
+        return false;
+    }
+
+    for (const auto& item : value["operations"])
+    {
+        if (!item.is_object())
+        {
+            error = "video control plan operation must be an object";
+            return false;
+        }
+        videocontrol::Operation operation;
+        operation.nodeId = item.value("nodeId", -1);
+        operation.kind = item.value("kind", std::string{});
+        operation.destination = item.value("destination", std::string{});
+        operation.targetClipId = item.value("targetClipId", -1);
+        operation.targetNodeId = item.value("targetNodeId", -1);
+        operation.targetParamId = item.value("targetParamId", std::string{});
+        operation.depth = item.value("depth", 1.0f);
+        operation.curve = parseCurve(item.value("curve", std::string("Linear")));
+        operation.smoothingBeats = item.value("smoothing", 0.0f);
+        operation.mode = parseMode(item.value("mode", std::string("Add")));
+        operation.enabled = item.value("enabled", true);
+
+        if (item.contains("inputs") && item["inputs"].is_array())
+            for (const auto& input : item["inputs"])
+            {
+                if (!input.is_array())
+                {
+                    error = "video control plan input must be an array";
+                    return false;
+                }
+                std::vector<int> fanIn;
+                for (const auto& slot : input)
+                    if (slot.is_number_integer()) fanIn.push_back(slot.get<int>());
+                    else
+                    {
+                        error = "video control plan input slot must be an integer";
+                        return false;
+                    }
+                operation.inputs.push_back(std::move(fanIn));
+            }
+
+        if (item.contains("params") && item["params"].is_array())
+            for (const auto& parameter : item["params"])
+                if (parameter.is_number()) operation.params.push_back(parameter.get<float>());
+                else
+                {
+                    error = "video control plan parameter must be numeric";
+                    return false;
+                }
+
+        if (item.contains("outputSlots") && item["outputSlots"].is_array())
+            for (const auto& slot : item["outputSlots"])
+                if (slot.is_number_integer()) operation.outputSlots.push_back(slot.get<int>());
+                else
+                {
+                    error = "video control plan output slot must be an integer";
+                    return false;
+                }
+
+        if (operation.kind == "source")
+        {
+            operation.source.type = parseSourceType(
+                item.value("sourceType", std::string("ClockBeatPhase")));
+            const auto parameter = [&operation](std::size_t index, float fallback)
+            {
+                return index < operation.params.size() ? operation.params[index] : fallback;
+            };
+            operation.source.trackId = static_cast<int>(std::lround(parameter(0, -1.0f)));
+            operation.source.pitchLo = parameter(1, 0.0f);
+            operation.source.pitchHi = parameter(2, 127.0f);
+            operation.source.primeIndex = static_cast<int>(std::lround(parameter(3, 1.0f)));
+            operation.source.axis = static_cast<int>(std::lround(parameter(4, 0.0f)));
+            operation.source.linkId = static_cast<int>(std::lround(parameter(5, -1.0f)));
+            operation.source.band = static_cast<int>(std::lround(parameter(6, 0.0f)));
+            operation.source.lissajousK = static_cast<int>(std::lround(parameter(7, 7.0f)));
+            operation.source.triggerDecayBeats = parameter(8, 0.5f);
+            operation.source.adsr = { parameter(9, 0.05f), parameter(10, 0.1f),
+                                      parameter(11, 0.8f), parameter(12, 0.2f),
+                                      parameter(13, 0.0f) };
+            operation.source.lfo.periodBeats = parameter(14, 1.0f);
+            operation.source.lfo.phase0 = parameter(15, 0.0f);
+            operation.source.lfo.seed = static_cast<uint32_t>(
+                std::lround(parameter(16, 1.0f)));
+            operation.source.lfo.shape = static_cast<arbitmod::LFOShape>(std::clamp(
+                static_cast<int>(std::lround(parameter(17, 0.0f))), 0, 4));
+            operation.source.lfo.hz = parameter(18, 0.0f) >= 0.5f;
+            operation.source.lfo.rateHz = parameter(19, 1.0f);
+            operation.source.lfo.retrigger = parameter(20, 0.0f) >= 0.5f;
+        }
+        plan.operations.push_back(std::move(operation));
+    }
+    return videocontrol::validatePlan(plan, error);
+}
+
+static videotime::BeatTimeline parseBeatTimelineJson (const json& owner,
+                                                      double fallbackBpm,
+                                                      double fallbackBeatsPerBar)
+{
+    std::vector<videotime::TempoPoint> tempos;
+    std::vector<videotime::MeterPoint> meters;
+    if (owner.contains("tempoMap") && owner["tempoMap"].is_array())
+        for (const auto& point : owner["tempoMap"])
+            if (point.is_object())
+                tempos.push_back({ point.value("beat", 0.0), point.value("bpm", fallbackBpm),
+                    point.value("interpolation", std::string("linear")) == "step" });
+    if (owner.contains("timeSignatureMap") && owner["timeSignatureMap"].is_array())
+        for (const auto& point : owner["timeSignatureMap"])
+            if (point.is_object())
+                meters.push_back({ point.value("beat", 0.0), point.value("numerator", 4),
+                    point.value("denominator", 4) });
+
+    videotime::BeatTimeline result;
+    if (tempos.empty() && meters.empty())
+    {
+        result.reset(fallbackBpm, fallbackBeatsPerBar);
+        return result;
+    }
+    if (tempos.empty())
+        tempos.push_back({ 0.0, fallbackBpm, true });
+    if (meters.empty())
+        meters.push_back({ 0.0,
+            std::max(1, static_cast<int>(std::llround(fallbackBeatsPerBar))), 4 });
+    result.set(std::move(tempos), std::move(meters));
+    return result;
+}
+
 // P3: resolve a clip/segment spec's shaderSource through the language front
 // door — GLSL passes through; Slang / SPIR-V (per the spec's `shaderLang`) are
 // lowered to GLSL here so the renderer only ever sees GLSL. On a lowering
@@ -434,8 +606,72 @@ static std::string resolveShaderSource (const json& spec)
     return std::string();
 }
 
+static bool admitProgrammableField (const json& owner, const char* sourceField,
+                                    const char* grantField, std::string& error)
+{
+    programmableruntime::Grant grant;
+    return programmableadmission::admitCatalogGpuField(owner, sourceField, grantField,
+                                                        grant, error);
+}
+
+static bool admitProgrammableJob (const json& params, std::string& error)
+{
+    if (! params.is_object()) { error = "programmable job params must be an object"; return false; }
+    for (const char* collection : { "segments", "clips" })
+    {
+        const auto it = params.find(collection);
+        if (it == params.end()) continue;
+        if (! it->is_array()) { error = std::string(collection) + " must be an array"; return false; }
+        for (const auto& member : *it)
+        {
+            if (! member.is_object()) { error = std::string(collection) + " members must be objects"; return false; }
+            if (! admitProgrammableField(member,"shaderSource","runtimeGrant",error)) return false;
+        }
+    }
+    const auto langIt = params.find("scriptLang");
+    if (langIt != params.end() && ! langIt->is_string()) { error = "scriptLang must be a string"; return false; }
+    const auto lang = langIt == params.end() ? std::string{} : langIt->get<std::string>();
+    if (lang != "" && lang != "lua" && lang != "js") { error = "scriptLang must be lua or js"; return false; }
+    for (const char* sourceField : { "luaScript", "jsScript" })
+    {
+        const auto it = params.find(sourceField);
+        if (it != params.end() && ! it->is_string()) { error = std::string(sourceField) + " must be a string"; return false; }
+    }
+    const auto luaSource = params.value("luaScript",std::string{});
+    const auto jsSource = params.value("jsScript",std::string{});
+    if ((! luaSource.empty() && lang != "lua") || (! jsSource.empty() && lang != "js")
+        || (! luaSource.empty() && ! jsSource.empty()))
+    { error = "script language/source mismatch"; return false; }
+    const auto source = lang == "lua" ? luaSource : jsSource;
+    if(!source.empty())
+    {
+        if (lang == "lua")
+        {
+           #if ! ARBIT_HAVE_LUA
+            error = "Lua runtime unavailable"; return false;
+           #endif
+        }
+        else
+        {
+           #if ! ARBIT_HAVE_QUICKJS
+            error = "QuickJS runtime unavailable"; return false;
+           #endif
+        }
+        programmableruntime::Grant grant;
+        const auto it=params.find("scriptRuntimeGrant");
+        if(it==params.end()){error="missing scriptRuntimeGrant";return false;}
+        const auto kind=lang=="lua"?programmableruntime::PayloadKind::lua:programmableruntime::PayloadKind::javascript;
+        if(!programmableadmission::admit(*it,kind,source,grant,error)) return false;
+    }
+    return true;
+}
+
 std::string parseExportJob (const json& params, ExportJob& job)
 {
+    std::string admissionError;
+    if(!admitProgrammableJob(params,admissionError)) return admissionError;
+    // Process-owned launch capability; jobSpec can neither supply nor override it.
+    job.depthCacheRoot = g_trustedDepthCacheRoot.string();
     const std::string encoder = params.value ("encoder", "auto");
     if (encoder != "auto" && encoder != "software" && encoder != "nvenc"
         && encoder != "videotoolbox")
@@ -446,6 +682,7 @@ std::string parseExportJob (const json& params, ExportJob& job)
         return "unknown interpolation: " + interpolation;
     const std::string codec = params.value ("codec", "h264");
     if (codec != "h264" && codec != "h265" && codec != "vp9" && codec != "prores"
+        && codec != "ffv1"
         && codec != "dpx")
         return "unknown codec: " + codec;
 
@@ -466,9 +703,18 @@ std::string parseExportJob (const json& params, ExportJob& job)
     job.feedbackPreRollSec = std::max (0.0, params.value ("feedbackPreRollSec", 0.0));
     job.bpm = params.value ("bpm", 120.0);
     job.beatsPerBar = params.value ("beatsPerBar", 4.0);
+    job.beatTimeline = parseBeatTimelineJson(params, job.bpm, job.beatsPerBar);
     job.luaScript = params.value ("luaScript", "");   // M8 per-frame hook (inert if no Lua)
     job.jsScript  = params.value ("jsScript", "");    // P2 JS per-frame hook (inert if no QuickJS)
     job.scriptLang = params.value ("scriptLang", ""); // "lua" | "js" | "" (infer)
+    if (! job.luaScript.empty() || ! job.jsScript.empty())
+    {
+        programmableruntime::Grant grant;
+        std::string ignored;
+        programmableadmission::parseGrant(params.at("scriptRuntimeGrant"), grant, ignored);
+        job.scriptCpuMs = grant.cpuMs;
+        job.scriptMemoryMiB = grant.memoryMiB;
+    }
     if (params.contains ("canvasBackground") && params["canvasBackground"].is_object())   // M1 canvas bg
     {
         const auto& bg = params["canvasBackground"];
@@ -486,34 +732,23 @@ std::string parseExportJob (const json& params, ExportJob& job)
         job.post.tonemap        = p.value ("tonemap", 0);
         job.post.exposure       = (float) p.value ("exposure", 1.0);
     }
-    if (params.contains ("segments"))
-        for (const auto& s : params["segments"])
-        {
-            ExportSegment seg;
-            seg.sourcePath = s.value ("sourcePath", "");
-            seg.clipId = s.value ("clipId", 0);
-            seg.trackLayer = s.value ("trackLayer", 0);
-            seg.inSec = s.value ("inSec", 0.0);
-            seg.outSec = s.value ("outSec", 0.0);
-            seg.rate = s.value ("rate", 1.0);
-            seg.displayStartSec = s.value ("displayStartSec", 0.0);
-            seg.sourceFps = s.value ("sourceFps", 0.0);
-            seg.seqStart = s.value ("seqStart", -1);
-            seg.retimeQuality = s.value ("retimeQuality", 0);   // per-clip retime tier (frame-perfect parity)
-            seg.matteDir = s.value ("matteDir", std::string {}); // AI roto alpha-matte sequence
-            seg.matteFps = s.value ("matteFps", 0.0);
-            seg.matteFrames = s.value ("matteFrames", 0);
-            if (s.contains ("transition"))
-            {
-                const auto& t = s["transition"];
-                seg.transitionType = t.value ("type", 0);
-                seg.transitionDurationSec = t.value ("durationSec", 0.0);
-            }
-            job.segments.push_back (seg);
-        }
-    std::sort (job.segments.begin(), job.segments.end(),
-               [] (const ExportSegment& a, const ExportSegment& b)
-               { return a.displayStartSec < b.displayStartSec; });
+    videowire::ResolvedVisualSnapshot snapshot;
+    std::string snapshotError;
+    if (! videowire::parseSnapshotJson (
+            params, resolveShaderSource, snapshot, snapshotError))
+        return snapshotError;
+    if (! videowire::validateSnapshotResources(snapshot,
+            [] (const std::string& path) { return std::filesystem::exists(path); },
+            g_trustedMatteCacheRoot, params.value("matteContentRevision", uint64_t { 0 }), snapshotError))
+        return snapshotError;
+    job.authoringRevision = snapshot.authoringRevision;
+    job.exportableRevision = params.value ("exportableRevision", job.authoringRevision);
+    if (job.authoringRevision != 0
+        && job.exportableRevision != job.authoringRevision)
+        return "current authoring revision is not exportable";
+    job.segments = std::move (snapshot.segments);
+    job.visualLayerPlans = std::move (snapshot.visualLayerPlans);
+    job.visualEventSchedules = std::move (snapshot.visualEventSchedules);
 
     if (params.contains ("clips"))
         for (const auto& c : params["clips"])
@@ -593,6 +828,14 @@ std::string parseExportJob (const json& params, ExportJob& job)
     if (params.contains ("modMatrix"))
         parseRoutingsJson (params["modMatrix"], job.routings);
 
+    if (params.contains("controlPlan"))
+    {
+        std::string controlPlanError;
+        if (!parseVideoControlPlanJson(params["controlPlan"], job.controlPlan,
+                                       controlPlanError))
+            return controlPlanError;
+    }
+
     if (params.contains ("texts"))
     {
         // Standard base64 ('+'/'/', '=' padding — what juce::Base64
@@ -652,6 +895,26 @@ std::string parseExportJob (const json& params, ExportJob& job)
     return {};
 }
 
+static std::string base64Encode (const std::vector<uint8_t>& bytes)
+{
+    static constexpr char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve ((bytes.size() + 2) / 3 * 4);
+    for (size_t i = 0; i < bytes.size(); i += 3)
+    {
+        const uint32_t a = bytes[i];
+        const uint32_t b = i + 1 < bytes.size() ? bytes[i + 1] : 0;
+        const uint32_t c = i + 2 < bytes.size() ? bytes[i + 2] : 0;
+        const uint32_t word = (a << 16) | (b << 8) | c;
+        out.push_back (alphabet[(word >> 18) & 63]);
+        out.push_back (alphabet[(word >> 12) & 63]);
+        out.push_back (i + 1 < bytes.size() ? alphabet[(word >> 6) & 63] : '=');
+        out.push_back (i + 2 < bytes.size() ? alphabet[word & 63] : '=');
+    }
+    return out;
+}
+
 // `export` runs on a worker thread with a DEFERRED reply: the RPC loop keeps
 // serving export_progress / export_cancel (and viewport traffic) while the
 // render runs, and the original request id is answered when it finishes.
@@ -672,27 +935,38 @@ void handleExportAsync (const json& idVal, const json& params)
         return;
     }
 
+    // A user export outranks background cache work. Cancel and join before
+    // claiming the shared compositor gate: joining while holding an export
+    // lease would deadlock waiting for the cache worker to release its lease.
+    {
+        std::lock_guard<std::mutex> wlock (g_renderCache.workerMutex);
+        g_renderCache.progress.abort.store (true);
+        if (g_renderCache.worker.joinable())
+            g_renderCache.worker.join();
+    }
+    auto compositorLease = g_compositorOwnership.tryClaim (
+        videohelper::CompositorOwnershipGate::Owner::exportJob);
+    if (! compositorLease)
+    {
+        replyError (idVal, "busy: production GPU compositor already owned");
+        return;
+    }
+
     g_export.progress.frame.store (0);
     g_export.progress.totalFrames.store (0);
     g_export.progress.encodeFps.store (0.0);
     g_export.progress.phase.store (1);
     g_export.progress.abort.store (false);
+    g_export.progress.visualTelemetry.resetSession();
     g_export.done.store (false);
     g_export.cancelled.store (false);
     g_export.jobId.fetch_add (1);
     g_export.active.store (true);
 
-    g_export.worker = std::thread ([idVal, job]
+    try
     {
-        // §Render cache: a user export outranks a background cache build —
-        // abort + join any in-flight build so two offscreen GL contexts are
-        // never alive at once (the plugin re-queues the build afterwards).
+        g_export.worker = std::thread ([idVal, job, compositorLease]
         {
-            std::lock_guard<std::mutex> wlock (g_renderCache.workerMutex);
-            g_renderCache.progress.abort.store (true);
-            if (g_renderCache.worker.joinable())
-                g_renderCache.worker.join();
-        }
         std::string usedEncoder, interpolationBackend;
         bool glCompositing = false;
         // Don't run viewport RIFE while the exporter holds the GPU (two CUDA
@@ -709,6 +983,11 @@ void handleExportAsync (const json& idVal, const json& params)
             result = { { "outPath", job->outPath }, { "encoder", usedEncoder },
                        { "glCompositing", glCompositing },
                        { "interpolationBackend", interpolationBackend } };
+#if defined(ARBIT_PROGRAMMABLE_TEST_MODE)
+        if (error.empty() && (! job->luaScript.empty() || ! job->jsScript.empty()))
+            result["testScriptLimitsAtOperation"] = {
+                { "cpuMs", job->scriptCpuMs }, { "memoryMiB", job->scriptMemoryMiB } };
+#endif
         {
             std::lock_guard<std::mutex> lock (g_export.resultMutex);
             g_export.error = error;
@@ -722,7 +1001,22 @@ void handleExportAsync (const json& idVal, const json& params)
             reply (idVal, result);
         else
             replyError (idVal, error);
-    });
+        });
+    }
+    catch (const std::system_error& e)
+    {
+        const std::string error = std::string ("failed to start export worker: ") + e.what();
+        {
+            std::lock_guard<std::mutex> lock (g_export.resultMutex);
+            g_export.error = error;
+            g_export.result = json {};
+        }
+        g_export.progress.phase.store (0);
+        g_export.done.store (true);
+        g_export.active.store (false);
+        compositorLease.reset();
+        replyError (idVal, error);
+    }
 }
 
 // `proxy_generate` runs on a worker thread with a DEFERRED reply, exactly
@@ -824,6 +1118,13 @@ void handleRenderCacheAsync (const json& idVal, const json& params)
     }
     job->intraOnly = true;
     job->audioPath.clear(); // video-only bake
+    auto compositorLease = g_compositorOwnership.tryClaim (
+        videohelper::CompositorOwnershipGate::Owner::renderCache);
+    if (! compositorLease)
+    {
+        replyError (idVal, "busy: production GPU compositor already owned");
+        return;
+    }
 
     g_renderCache.progress.frame.store (0);
     g_renderCache.progress.totalFrames.store (0);
@@ -836,8 +1137,10 @@ void handleRenderCacheAsync (const json& idVal, const json& params)
     g_renderCache.active.store (true);
 
     std::lock_guard<std::mutex> wlock (g_renderCache.workerMutex);
-    g_renderCache.worker = std::thread ([idVal, job]
+    try
     {
+        g_renderCache.worker = std::thread ([idVal, job, compositorLease]
+        {
         std::string usedEncoder, interpolationBackend;
         bool glCompositing = false;
 #if ARBIT_HAVE_VIEWPORT
@@ -859,6 +1162,11 @@ void handleRenderCacheAsync (const json& idVal, const json& params)
         if (error.empty())
             result = { { "outPath", job->outPath }, { "encoder", usedEncoder },
                        { "frames", (int64_t) g_renderCache.progress.frame.load() } };
+#if defined(ARBIT_PROGRAMMABLE_TEST_MODE)
+        if (error.empty() && (! job->luaScript.empty() || ! job->jsScript.empty()))
+            result["testScriptLimitsAtOperation"] = {
+                { "cpuMs", job->scriptCpuMs }, { "memoryMiB", job->scriptMemoryMiB } };
+#endif
         {
             std::lock_guard<std::mutex> lock (g_renderCache.resultMutex);
             g_renderCache.error = error;
@@ -872,7 +1180,22 @@ void handleRenderCacheAsync (const json& idVal, const json& params)
             reply (idVal, result);
         else
             replyError (idVal, error);
-    });
+        });
+    }
+    catch (const std::system_error& e)
+    {
+        const std::string error = std::string ("failed to start render cache worker: ") + e.what();
+        {
+            std::lock_guard<std::mutex> lock (g_renderCache.resultMutex);
+            g_renderCache.error = error;
+            g_renderCache.result = json {};
+        }
+        g_renderCache.progress.phase.store (0);
+        g_renderCache.done.store (true);
+        g_renderCache.active.store (false);
+        compositorLease.reset();
+        replyError (idVal, error);
+    }
 }
 
 json handle (const std::string& method, const json& params, std::string& error)
@@ -891,6 +1214,27 @@ json handle (const std::string& method, const json& params, std::string& error)
 #else
                       { "beatDetection", false } };
 #endif
+
+    if (method == "gpu_backend_info" || method == "gpu_backend_selftest")
+    {
+        if (method == "gpu_backend_info")
+        {
+            const auto info = arbitgpu::queryNativeBackend();
+            return json { { "available", info.available }, { "backend", info.backend },
+                          { "device", info.device }, { "compute", info.compute },
+                          { "error", info.error } };
+        }
+
+        const auto test = arbitgpu::runNativeBackendSelfTest();
+        return json { { "ok", test.computePassed && test.renderPassed },
+                      { "available", test.available }, { "backend", test.backend },
+                      { "device", test.device }, { "compute", test.compute },
+                      { "computePassed", test.computePassed },
+                      { "renderPassed", test.renderPassed },
+                      { "computeChecksum", test.computeChecksum },
+                      { "renderChecksum", test.renderChecksum },
+                      { "error", test.error } };
+    }
 
     if (method == "rife_selftest")
     {
@@ -1286,6 +1630,59 @@ json handle (const std::string& method, const json& params, std::string& error)
         return json { { "outPath", params["outPath"] }, { "frames", frames } };
     }
 
+    if (method == "recipe_preview")
+    {
+        if (g_export.active.load() || g_renderCache.active.load())
+        {
+            error = "production GPU compositor is busy";
+            return {};
+        }
+        ExportJob job;
+        if (auto parseError = parseExportJob(params, job); ! parseError.empty())
+        {
+            error = parseError;
+            return {};
+        }
+        if (job.width < 1 || job.height < 1 || job.width > 640 || job.height > 360)
+        {
+            error = "recipe preview dimensions are outside the bounded GPU preview size";
+            return {};
+        }
+        job.durationSec = 1.0 / std::max(1.0, job.fps);
+        job.startSec = 0.0;
+        job.endSec = job.durationSec;
+        job.encoder = "software";
+        job.codec = "h264";
+        std::string encoder, interpolation;
+        bool gpuComposited = false;
+        error = runExport(job, encoder, gpuComposited, interpolation, nullptr);
+        if (! error.empty()) return {};
+        if (! gpuComposited)
+        {
+            std::filesystem::remove(job.outPath);
+            error = "recipe preview requires the production GPU compositor";
+            return {};
+        }
+        MediaContext rendered;
+        if (auto openError = rendered.open(job.outPath, false); ! openError.empty())
+        {
+            std::filesystem::remove(job.outPath);
+            error = openError;
+            return {};
+        }
+        std::vector<std::string> paths;
+        error = rendered.writeThumbnails({ 0.0 }, job.width, job.height,
+            params.value("previewDirectory", std::string {}),
+            params.value("previewBaseName", std::string { "visual-recipe" }), paths);
+        std::filesystem::remove(job.outPath);
+        if (! error.empty() || paths.empty())
+        {
+            if (error.empty()) error = "recipe preview produced no rendered image";
+            return {};
+        }
+        return json { { "path", paths.front() }, { "gpuComposited", true } };
+    }
+
     if (method == "thumbnails")
     {
         auto* media = findMedia (params, error);
@@ -1310,6 +1707,61 @@ json handle (const std::string& method, const json& params, std::string& error)
 
     // NOTE: "export" is handled in main() (deferred reply — handleExportAsync).
     // NOTE: "proxy_generate" too (deferred reply — handleProxyAsync).
+
+    if (method == "composite_frame_probe")
+    {
+        auto compositorLease = g_compositorOwnership.tryClaim (
+            videohelper::CompositorOwnershipGate::Owner::frameProbe);
+        if (! compositorLease)
+        {
+            error = "production GPU compositor is busy";
+            return {};
+        }
+        ExportJob job;
+        if (error = parseExportJob (params, job); ! error.empty()) return {};
+        const double timelineSec = params.value ("timelineSec", -1.0);
+        videowire::ResolvedVisualSnapshot identity;
+        identity.authoringRevision = job.authoringRevision;
+        identity.segments = job.segments;
+        identity.visualLayerPlans = job.visualLayerPlans;
+        identity.visualEventSchedules = job.visualEventSchedules;
+        const auto snapshotGeneration = params.value ("snapshotGeneration", uint64_t { 0 });
+        if (! videohelper::validateCompositeProbeContract (
+                identity, snapshotGeneration, timelineSec,
+                job.width, job.height, job.fps, error)) return {};
+        const auto clipRevisions = params.value ("clipRevisions", json::array());
+        if (! clipRevisions.is_array())
+        {
+            error = "snapshot clip revision records do not match compiled plans";
+            return {};
+        }
+        std::vector<videohelper::SnapshotClipIdentity> identityRecords;
+        for (const auto& record : clipRevisions)
+            identityRecords.push_back ({ record.value ("clipId", -1),
+                record.value ("authoredStructuralRevision", uint64_t { 0 }),
+                record.value ("identityMode", std::string {}),
+                record.value ("snapshotCompiledExportable", false) });
+        if (! videohelper::validateSnapshotClipIdentities (
+                job.visualLayerPlans, identityRecords, error))
+            return {};
+        CompositeFrameResult frame;
+        error = renderCompositeFrame (job, timelineSec, frame);
+        if (! error.empty()) return {};
+        return json {
+            { "width", frame.width }, { "height", frame.height },
+            { "format", "rgba8" }, { "strideBytes", frame.width * 4 },
+            { "snapshotGeneration", snapshotGeneration },
+            { "clipRevisions", clipRevisions },
+            { "graphLayerCount", job.visualLayerPlans.size() },
+            { "compositorBackend", frame.compositorBackend },
+            { "presentationBackend", frame.presentationBackend },
+            { "rgbaBase64", base64Encode (frame.rgba) }
+#if defined(ARBIT_PROGRAMMABLE_TEST_MODE)
+            , { "testScriptLimitsAtOperation", {
+                { "cpuMs", job.scriptCpuMs }, { "memoryMiB", job.scriptMemoryMiB } } }
+#endif
+        };
+    }
 
     if (method == "proxy_progress")
     {
@@ -1395,6 +1847,8 @@ json handle (const std::string& method, const json& params, std::string& error)
             { "frame", g_export.progress.frame.load() },
             { "totalFrames", g_export.progress.totalFrames.load() },
             { "fps", g_export.progress.encodeFps.load() },
+            { "visualTelemetry", videowire::visualTelemetryJson(
+                g_export.progress.visualTelemetry.snapshot()) },
         };
         if (g_export.done.load())
         {
@@ -1560,6 +2014,12 @@ json handle (const std::string& method, const json& params, std::string& error)
         return json { { "ok", true } };
     }
 
+    if (method == "viewport_set_canvas_frame_enabled")
+    {
+        g_viewport.setCanvasFrameEnabled (params.value ("enabled", true));
+        return json { { "ok", true } };
+    }
+
     if (method == "viewport_set_canvas_background")
     {
         // Live canvas background colour (preview == export for M1's bgColor).
@@ -1612,31 +2072,116 @@ json handle (const std::string& method, const json& params, std::string& error)
 
     if (method == "viewport_set_timeline")
     {
-        std::vector<ViewportSegment> segs;
-        if (params.contains ("segments"))
-            for (const auto& s : params["segments"])
+        if(!admitProgrammableJob(params,error)) return {};
+        videowire::ResolvedVisualSnapshot snapshot;
+        if (! videowire::parseSnapshotJson (params, resolveShaderSource, snapshot, error))
+        {
+            g_viewport.rejectSnapshot (
+                params.value ("authoringRevision",
+                              params.value ("structuralRevision", uint64_t { 0 })));
+            return {};
+        }
+        if (! videowire::validateSnapshotResources (
+                snapshot,
+                [] (const std::string& path) { return std::filesystem::exists (path); },
+                g_trustedMatteCacheRoot,
+                params.value("matteContentRevision", uint64_t { 0 }),
+                error))
+        {
+            g_viewport.rejectSnapshot (snapshot.authoringRevision);
+            return {};
+        }
+        if (g_testRejectNextSnapshot)
+        {
+            g_testRejectNextSnapshot = false;
+            g_viewport.rejectSnapshot (snapshot.authoringRevision);
+            error = "forced renderer admission rejection";
+            return {};
+        }
+        if (g_testDeferNextSnapshot)
+        {
+            g_testDeferNextSnapshot = false;
+            if (! g_viewport.beginSnapshot (snapshot.authoringRevision))
             {
-                ViewportSegment seg;
-                seg.sourcePath = s.value ("sourcePath", "");
-                seg.clipId = s.value ("clipId", 0);
-                seg.inSec = s.value ("inSec", 0.0);
-                seg.outSec = s.value ("outSec", 0.0);
-                seg.rate = s.value ("rate", 1.0);
-                seg.retimeQuality = s.value ("retimeQuality", 0);
-                seg.displayStartSec = s.value ("displayStartSec", 0.0);
-                seg.trackLayer = s.value ("trackLayer", 0);
-                seg.sourceFps = s.value ("sourceFps", 0.0);
-                seg.seqStart = s.value ("seqStart", -1);
-                seg.shaderSource = resolveShaderSource (s);   // P3: GLSL/Slang/SPIR-V
-                if (s.contains ("transition"))
-                {
-                    const auto& t = s["transition"];
-                    seg.transitionType = t.value ("type", 0);
-                    seg.transitionDurationSec = t.value ("durationSec", 0.0);
-                }
-                segs.push_back (seg);
+                error = "stale deferred authoring revision";
+                return {};
             }
-        g_viewport.setTimeline (std::move (segs));
+            g_testDeferredSnapshot = std::move (snapshot);
+            return json { { "deferred", true } };
+        }
+        if (! g_viewport.installSnapshot (std::move (snapshot)))
+        {
+            error = "stale authoring revision";
+            return {};
+        }
+        const auto revisions = g_viewport.revisionState();
+        return json { { "ok", true },
+                      { "authoringRevision", revisions.authoring },
+                      { "acceptedRevision", revisions.accepted },
+                      { "rejectedRevision", revisions.rejected },
+                      { "compiledRevision", revisions.compiled },
+                      { "lastGoodRevision", revisions.lastGood },
+                      { "exportableRevision", revisions.exportable },
+                      { "evaluationSequence", revisions.evaluation } };
+    }
+
+    if (method == "viewport_set_inspection")
+    {
+        error = g_viewport.setInspectionTarget(params.value("clipId", -1),
+            params.value("structuralRevision", uint64_t { 0 }),
+            params.value("nodeId", 0), params.value("outputPort", -1));
+        if (! error.empty()) return {};
+        return json { { "ok", true } };
+    }
+
+    if (method == "viewport_describe_inspection")
+        return json::parse(g_viewport.describeInspection());
+
+    if (method == "viewport_set_inspection_presentation")
+    {
+        videopreview::State state;
+        state.layout = static_cast<videopreview::Layout>(params.value("layout", 0));
+        state.background = static_cast<videopreview::Background>(params.value("background", 0));
+        state.zoom = params.value("zoom", 1.0f);
+        state.panX = params.value("panX", 0.0f);
+        state.panY = params.value("panY", 0.0f);
+        state.split = params.value("split", 0.5f);
+        error = g_viewport.setInspectionPresentation(state);
+        if (! error.empty()) return {};
+        return json { { "ok", true } };
+    }
+
+    if (method == "test_reject_next_snapshot")
+    {
+        g_testRejectNextSnapshot = true;
+        return json { { "ok", true } };
+    }
+
+    if (method == "test_defer_next_snapshot")
+    {
+        if (g_testDeferredSnapshot.has_value())
+        {
+            error = "a deferred snapshot is already pending";
+            return {};
+        }
+        g_testDeferNextSnapshot = true;
+        return json { { "ok", true } };
+    }
+
+    if (method == "test_release_deferred_snapshot")
+    {
+        if (! g_testDeferredSnapshot.has_value())
+        {
+            error = "no deferred snapshot is pending";
+            return {};
+        }
+        auto snapshot = std::move (*g_testDeferredSnapshot);
+        g_testDeferredSnapshot.reset();
+        if (! g_viewport.completeSnapshot (std::move (snapshot)))
+        {
+            error = "deferred snapshot is no longer current";
+            return {};
+        }
         return json { { "ok", true } };
     }
 
@@ -1654,6 +2199,13 @@ json handle (const std::string& method, const json& params, std::string& error)
         return json { { "ok", true } };
     }
 
+    if (method == "viewport_set_beat_timeline")
+    {
+        g_viewport.setBeatTimeline(parseBeatTimelineJson(
+            params, params.value("bpm", 120.0), params.value("beatsPerBar", 4.0)));
+        return json { { "ok", true } };
+    }
+
     if (method == "viewport_set_mod_matrix")
     {
         // M6 live mod matrix: same wire schema as the export jobSpec's
@@ -1665,6 +2217,44 @@ json handle (const std::string& method, const json& params, std::string& error)
         return json { { "ok", true } };
     }
 
+    if (method == "viewport_set_control_plan")
+    {
+        videocontrol::Plan plan;
+        std::string controlPlanError;
+        if (!parseVideoControlPlanJson(params, plan, controlPlanError))
+        {
+            error = controlPlanError;
+            return {};
+        }
+        g_viewport.setControlPlan(std::move(plan));
+        return json { { "ok", true } };
+    }
+
+    if (method == "viewport_visual_event")
+    {
+        const std::string kind = params.value("kind", std::string {});
+        const int clipId = params.value("clipId", -1);
+        const auto parseId = [&params](const char* key) -> uint64_t
+        {
+            const auto found = params.find(key);
+            if (found == params.end()) return 0;
+            if (found->is_string())
+            {
+                try { return std::stoull(found->get<std::string>()); }
+                catch (...) { return 0; }
+            }
+            return found->is_number_unsigned() ? found->get<uint64_t>() : 0;
+        };
+        const uint64_t sequence = parseId("sequence");
+        const uint64_t epoch = parseId("epoch");
+        if (sequence == 0 || !g_viewport.enqueueVisualEvent(kind, clipId, sequence, epoch))
+        {
+            error = "invalid, stale, or over-cap visual event receipt";
+            return {};
+        }
+        return json { { "ok", true } };
+    }
+
     if (method == "viewport_set_script")
     {
         // P2 Scripts-tab live preview: the project-global per-frame hook (same
@@ -1673,7 +2263,27 @@ json handle (const std::string& method, const json& params, std::string& error)
         // viewport compiles + runs frame() on the render thread (see setScript).
         const std::string source = params.value ("source", std::string {});
         const std::string lang   = params.value ("lang",   std::string {});
-        g_viewport.setScript (source, lang);
+        programmableruntime::Grant grant;
+        if(!source.empty())
+        {
+            if (lang == "lua")
+            {
+               #if ! ARBIT_HAVE_LUA
+                error = "Lua runtime unavailable"; return {};
+               #endif
+            }
+            else
+            {
+               #if ! ARBIT_HAVE_QUICKJS
+                error = "QuickJS runtime unavailable"; return {};
+               #endif
+            }
+            const auto it=params.find("runtimeGrant");
+            const auto kind=lang=="lua"?programmableruntime::PayloadKind::lua:programmableruntime::PayloadKind::javascript;
+            if(it==params.end() || !programmableadmission::admit(*it,kind,source,grant,error))
+            { if(error.empty()) error="missing runtimeGrant"; return {}; }
+        }
+        g_viewport.setScript (source, lang, grant.cpuMs, grant.memoryMiB);
         return json { { "ok", true } };
     }
 
@@ -1688,6 +2298,9 @@ json handle (const std::string& method, const json& params, std::string& error)
                                      params["value"].get<double>(),
                                      params.value ("atBeat", -1.0));
         if (! error.empty()) return {};
+        const auto runtimeRevision = params.value ("runtimeRevision", uint64_t { 0 });
+        g_viewport.acceptRuntimeRevision (runtimeRevision);
+        g_viewport.advanceEvaluation (runtimeRevision);
         return json { { "ok", true } };
     }
 
@@ -1742,6 +2355,15 @@ json handle (const std::string& method, const json& params, std::string& error)
     if (method == "shader_compile")
     {
         const std::string source = params.value ("source", std::string());
+        programmableruntime::Grant runtimeGrant;
+        const auto grantIt=params.find("runtimeGrant");
+        if(!source.empty() && (grantIt==params.end()
+            || !programmableadmission::admit(*grantIt,
+                programmableruntime::PayloadKind::shader,source,runtimeGrant,error)))
+        { if(error.empty()) error="missing or invalid runtimeGrant"; return {}; }
+        if (! source.empty() && ! programmableadmission::admitsGpuPayload(
+                runtimeGrant, programmableruntime::PayloadKind::shader, error))
+            return {};
         // P3: lower Slang / SPIR-V to GLSL at the GL-free front door, then run
         // the existing dialect wrap on the lowered GLSL (a bare-GLSL shader).
         const auto lang = arbitshadercompile::langFromWire (params.value ("lang", std::string()));
@@ -1805,6 +2427,27 @@ json handle (const std::string& method, const json& params, std::string& error)
         const std::string source = params.value ("source", std::string());
         const std::string lang   = params.value ("lang", std::string());
         const bool wantJs = (lang != "lua");   // default JS; Scripts tab sends it explicitly
+        if (! source.empty())
+        {
+            if (wantJs)
+            {
+               #if ! ARBIT_HAVE_QUICKJS
+                error = "QuickJS runtime unavailable"; return {};
+               #endif
+            }
+            else
+            {
+               #if ! ARBIT_HAVE_LUA
+                error = "Lua runtime unavailable"; return {};
+               #endif
+            }
+        }
+        programmableruntime::Grant runtimeGrant;
+        const auto grantIt=params.find("runtimeGrant");
+        const auto payloadKind=wantJs?programmableruntime::PayloadKind::javascript:programmableruntime::PayloadKind::lua;
+        if(!source.empty() && (grantIt==params.end()
+            || !programmableadmission::admit(*grantIt,payloadKind,source,runtimeGrant,error)))
+        { if(error.empty()) error="missing runtimeGrant"; return {}; }
         std::string err;
         bool ok = false;
         bool available = false;
@@ -1814,7 +2457,7 @@ json handle (const std::string& method, const json& params, std::string& error)
             available = true;
            #endif
             arbitjs::JsHook hook;
-            ok = hook.compile (source, err);
+            ok = hook.compile (source, err, runtimeGrant.cpuMs, runtimeGrant.memoryMiB);
         }
         else
         {
@@ -1822,7 +2465,7 @@ json handle (const std::string& method, const json& params, std::string& error)
             available = true;
            #endif
             arbitlua::LuaHook hook;
-            ok = hook.compile (source, err);
+            ok = hook.compile (source, err, runtimeGrant.cpuMs, runtimeGrant.memoryMiB);
         }
         return json { { "ok", ok },
                       { "engine", wantJs ? "js" : "lua" },
@@ -1904,6 +2547,11 @@ json handle (const std::string& method, const json& params, std::string& error)
             { "interpTargetFps", vi.interpTargetFps },
             { "interpError", vi.interpError },
             { "gpuPath", vi.gpuPath },
+            { "backendPolicy", vi.backendPolicy },
+            { "compositorBackend", vi.compositorBackend },
+            { "particleBackend", vi.particleBackend },
+            { "rendererError", vi.rendererError },
+            { "fallbackCount", vi.fallbackCount },
             { "framesPresented", vi.framesPresented },
             { "frameHash", vi.lastFrameHash },
             { "displaySec", vi.displaySec },
@@ -1925,6 +2573,7 @@ json handle (const std::string& method, const json& params, std::string& error)
             { "viewZoom", vi.viewZoom },
             { "viewPanX", vi.viewPanX },
             { "viewPanY", vi.viewPanY },
+            { "graphTelemetry", videowire::visualTelemetryJson(vi.graphTelemetry) },
             { "gpu", {
                 { "glMajor", vi.gpuCaps.glMajor },
                 { "glMinor", vi.gpuCaps.glMinor },
@@ -1986,6 +2635,9 @@ json handle (const std::string& method, const json& params, std::string& error)
         }
         closeAllCaptureSessions();
         cancelAllRecorderSessions();
+#if ARBIT_HAVE_VIEWPORT
+        g_viewport.close();
+#endif
         reply (json(), json { { "ok", true } });
         std::exit (0);
     }
@@ -1995,8 +2647,83 @@ json handle (const std::string& method, const json& params, std::string& error)
 }
 } // namespace
 
-int main()
+int main (int argc, char** argv)
 {
+#if defined(ARBIT_PROGRAMMABLE_TEST_MODE)
+    bool testPrivateFdClosed = false, testMarkerInArgvOrEnv = false;
+    bool testPacketZero = false, testSourceZero = false;
+#endif
+#if ! defined(_WIN32)
+    std::array<uint8_t, programmableruntime::privatepayload::packetSize> sessionPacket {};
+    if (! programmableruntime::privatepayload::readOneShot(3, sessionPacket))
+    {
+        std::fprintf(stderr, "missing private programmable-runtime session secret\n");
+        return 2;
+    }
+    programmableruntime::SessionSecret sessionSecret {};
+    std::copy_n(sessionPacket.begin(), sessionSecret.size(), sessionSecret.begin());
+    uint64_t sessionGeneration = 0;
+    for (size_t i = sessionSecret.size(); i < sessionPacket.size(); ++i)
+        sessionGeneration = (sessionGeneration << 8) | sessionPacket[i];
+    programmableadmission::verifier().reset(std::move(sessionSecret), sessionGeneration);
+    volatile uint8_t* packetBytes = sessionPacket.data();
+    for (size_t i = 0; i < sessionPacket.size(); ++i) packetBytes[i] = 0;
+#if defined(ARBIT_PROGRAMMABLE_TEST_MODE)
+    testPrivateFdClosed = fcntl(3, F_GETFD) == -1 && errno == EBADF;
+    testPacketZero = std::all_of(sessionPacket.begin(), sessionPacket.end(), [](uint8_t b) { return b == 0; });
+    testSourceZero = std::all_of(sessionSecret.begin(), sessionSecret.end(), [](uint8_t b) { return b == 0; });
+    const std::string marker = "M6_PRIVATE_CHANNEL_MARKER";
+    for (int i = 0; i < argc; ++i) testMarkerInArgvOrEnv |= std::string(argv[i]).find(marker) != std::string::npos;
+    extern char** environ;
+    for (char** entry = environ; entry != nullptr && *entry != nullptr; ++entry)
+        testMarkerInArgvOrEnv |= std::string(*entry).find(marker) != std::string::npos;
+#endif
+#endif
+    std::filesystem::path requestedMatteRoot, requestedDepthRoot;
+    for (int i = 1; i < argc; ++i)
+    {
+        const std::string argument (argv[i]);
+        if (argument == "--matte-cache-root" && ++i < argc && requestedMatteRoot.empty())
+            requestedMatteRoot = std::filesystem::path(argv[i]);
+        else if (argument == "--depth-cache-root" && ++i < argc && requestedDepthRoot.empty())
+            requestedDepthRoot = std::filesystem::path(argv[i]);
+        else
+        {
+            std::fprintf(stderr, "usage: %s --matte-cache-root <dir> --depth-cache-root <dir>\n", argv[0]);
+            return 2;
+        }
+    }
+    std::error_code matteRootError;
+    if (! requestedMatteRoot.is_absolute()
+        || std::filesystem::is_symlink(requestedMatteRoot, matteRootError)
+        || ! std::filesystem::is_directory(requestedMatteRoot, matteRootError))
+    {
+        std::fprintf (stderr, "invalid or missing --matte-cache-root\n");
+        return 2;
+    }
+    g_trustedMatteCacheRoot = std::filesystem::canonical(requestedMatteRoot, matteRootError);
+    if (matteRootError)
+    {
+        std::fprintf (stderr, "cannot canonicalize --matte-cache-root\n");
+        return 2;
+    }
+    std::error_code depthRootError;
+    if (!requestedDepthRoot.is_absolute()
+        || std::filesystem::is_symlink(requestedDepthRoot, depthRootError)
+        || !std::filesystem::is_directory(requestedDepthRoot, depthRootError))
+    {
+        std::fprintf(stderr, "invalid or missing --depth-cache-root\n");
+        return 2;
+    }
+    g_trustedDepthCacheRoot = std::filesystem::canonical(requestedDepthRoot, depthRootError);
+    if (depthRootError)
+    {
+        std::fprintf(stderr, "cannot canonicalize --depth-cache-root\n");
+        return 2;
+    }
+#if ARBIT_HAVE_VIEWPORT
+    g_viewport.setDepthCacheRoot(g_trustedDepthCacheRoot.string());
+#endif
     av_log_set_level (AV_LOG_ERROR);
 
     // Initialize the shared CUDA hardware-decode context ONCE, single-threaded,
@@ -2013,38 +2740,47 @@ int main()
     _setmode (_fileno (stdout), _O_BINARY);
 #endif
 
-    std::string line;
-    while (std::getline (std::cin, line))
+    const auto processRequest = [&] (const char* lineData, size_t lineSize)
     {
-        if (line.empty()) continue;
+        if (lineSize == 0) return;
 
-        json req = json::parse (line, nullptr, false);
+        json req = json::parse (lineData, lineData + lineSize, nullptr, false);
         if (req.is_discarded())
         {
             replyError (json(), "parse error");
-            continue;
+            return;
         }
 
         const json idVal = req.value ("id", json());
         const std::string method = req.value ("method", "");
         const json params = req.contains ("params") ? req["params"] : json::object();
 
+#if defined(ARBIT_PROGRAMMABLE_TEST_MODE)
+        if (method == "test_private_startup_diagnostics")
+        {
+            reply(idVal, json { { "privateFdClosed", testPrivateFdClosed },
+                { "markerAbsentArgvEnv", ! testMarkerInArgvOrEnv },
+                { "packetTemporaryZero", testPacketZero }, { "sourceTemporaryZero", testSourceZero } });
+            return;
+        }
+#endif
+
         if (method == "export")
         {
             handleExportAsync (idVal, params); // deferred reply from the worker
-            continue;
+            return;
         }
 
         if (method == "proxy_generate")
         {
             handleProxyAsync (idVal, params); // deferred reply from the worker
-            continue;
+            return;
         }
 
         if (method == "render_cache_build")
         {
             handleRenderCacheAsync (idVal, params); // deferred reply
-            continue;
+            return;
         }
 
         std::string error;
@@ -2053,7 +2789,45 @@ int main()
             replyError (idVal, error);
         else
             reply (idVal, result);
+    };
+
+    constexpr size_t kMaxStdinLineBytes = 16u * 1024u * 1024u;
+    auto readBoundedLine = [&] (std::vector<char>& destination)
+    {
+        const auto result = videohelper::readBoundedLine (
+            std::cin, destination, kMaxStdinLineBytes);
+        if (result == videohelper::BoundedLineResult::oversized)
+        {
+            replyError (nullptr, "request line exceeds 16 MiB cap");
+            return false;
+        }
+        return result == videohelper::BoundedLineResult::line;
+    };
+    std::vector<char> line;
+#if defined(__APPLE__) && ARBIT_HAVE_VIEWPORT
+    // Keep AppKit event routing on the process main thread while stdin remains
+    // responsive. stdio may already have buffered another JSON line, so check
+    // its stream buffer before waiting on the underlying descriptor.
+    while (true)
+    {
+        g_viewport.processWindowEvents();
+        if (std::cin.rdbuf()->in_avail() <= 0)
+        {
+            pollfd input { STDIN_FILENO, POLLIN, 0 };
+            const int ready = poll (&input, 1, 8);
+            if (ready < 0 || ready == 0)
+                continue;
+            if ((input.revents & (POLLIN | POLLHUP)) == 0)
+                break;
+        }
+        if (! readBoundedLine (line))
+            break;
+        if (! line.empty()) processRequest (line.data(), line.size());
     }
+#else
+    while (readBoundedLine (line))
+        if (! line.empty()) processRequest (line.data(), line.size());
+#endif
 
     // stdin closed (Arbit quit/killed us politely): stop any running export,
     // proxy or render-cache job before static teardown destroys the joinable
@@ -2072,5 +2846,8 @@ int main()
     }
     closeAllCaptureSessions();
     cancelAllRecorderSessions();
+#if ARBIT_HAVE_VIEWPORT
+    g_viewport.close();
+#endif
     return 0;
 }

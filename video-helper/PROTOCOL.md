@@ -3,15 +3,60 @@
 JSON-RPC 2.0 over stdio, line-delimited (same transport as all other helper
 methods). This file documents the GPU viewport surface added Jun 2026.
 
+## Native GPU backend diagnostics
+
+`gpu_backend_info` performs a cheap native-device query and returns
+`{available, backend, device, compute, error}`. On Apple builds with
+`ARBIT_WITH_METAL=ON`, `backend` is `"metal"`; this query submits no GPU work.
+
+`gpu_backend_selftest` initializes the P6 `sokol_gfx` Metal backend for one
+isolated test, dispatches a deterministic compute kernel, renders a known colour
+into an offscreen Metal texture, reads both results back, and returns
+`computePassed`, `renderPassed`, and stable checksums.
+
+The first renderer-facing P6 slice is enabled by default on Apple builds:
+particle-layer simulation and point rasterization run natively in Metal. The
+result remains on the GPU: an IOSurface
+bridges the Metal BGRA8 target into the existing OpenGL compositor. If Metal,
+pipeline creation, or the bridge is unavailable, the layer automatically uses
+the existing macOS OpenGL 4.1 fragment/MRT particle path. Set
+`ARBIT_VIDEO_METAL=0` only to force that recovery path. Other layer generation,
+effects, compositing, and presentation remain OpenGL, so
+`viewport_info.gpuPath` and `presentPath` still report that real end-to-end
+path. `viewport_info.compositorBackend` reports the production compositor used
+for the latest frame (`metal` or `opengl`), while `particleBackend` separately reports `metal`,
+`opengl-fragment`, `pending`, or `none` for the latest composite frame.
+
+Apple developer builds also produce `arbit-metal-particle-smoke`. Run it from
+an ordinary macOS Terminal session to create a hidden CGL context, render the
+same deterministic note-fed particle frame through both the GL fallback and
+Metal/IOSurface bridge, and print hashes plus coverage statistics. It fails if
+either path is blank, if Metal silently fell back to GL, or if particle coverage
+diverges grossly. It is deliberately not registered as an automatic CTest
+because headless CI and sandboxed service processes have no Aqua/WindowServer
+connection.
+
 ## Clock: transport shared-memory block
 
 Arbit creates a tiny shm region (`videoshm::TransportBlock`, seqlock) and
 tells the helper its name via `attach_transport {name}`. Arbit's **audio
 thread** writes it once per audio block: `{playing, playheadBeats, bpm,
-sampleTime, sampleRate, hostTimeNs}`. The helper's render loop reads it
-lock-free each frame and extrapolates the playhead against its monotonic
+sampleTime, sampleRate, hostTimeNs}`. Transport version 2 also carries at most
+eight stable-track-ID feature slots (`tapPoint`, RMS, peak, onset) in the same
+seqlock transaction. These are bounded typed scalars derived from admitted
+Session Graph sources; no per-track raw-audio rings cross the process boundary.
+Missing/stale track owners evaluate to zero. Per-track spectral bands are not
+silently approximated in version 2: plans must use master `AudioBand` or a
+track/group RMS, peak, or onset source. Export rejects plans containing these
+live-only track/group sources until the job carries a deterministic per-track
+feature stream; it never substitutes the master mix. The helper's render loop
+reads it lock-free each frame and extrapolates the playhead against its monotonic
 clock (extrapolation clamped to 0.5 s so a stalled writer freezes rather than
-runs away). Audio is master; video chases. No RPC is involved per frame.
+runs away). `viewport_set_beat_timeline` supplies the processor-owned
+`tempoMap[]` (`beat`, `bpm`, `interpolation`) and `timeSignatureMap[]`
+(`beat`, `numerator`, `denominator`). The shared-memory beat is converted
+through that immutable map; no RPC is involved per frame. Audio is master;
+video chases.
 
 ## Window management
 
@@ -57,8 +102,60 @@ under a top-level `canvas` object.
 
 ## Timeline
 
-`viewport_set_timeline {segments: [{sourcePath, clipId, inSec, outSec, rate,
-displayStartSec}]}` — the same constant-rate segment shape the exporter uses.
+`viewport_set_timeline {structuralRevision, matteContentRevision, segments: [{sourceKind?, sourcePath,
+clipId, isAdjustment?, inSec, outSec, rate, displayStartSec, matteAssetId?,
+matteAssetVersion?, matteContentReceipt?, matteState?, matteCacheKey?, matteFramePrefix?,
+matteFrameExtension?, matteFirstFrame?, matteFrameDigits?, matteFps?, matteFrames?,
+transition?: {type, durationSec, fromClipId?, toClipId?}}]}` — the same constant-rate segment shape
+the exporter uses. Matte bindings carry the complete project-owned identity/naming tuple,
+and use only a processor-published immutable cache key. The helper accepts its trusted
+absolute cache root exclusively from the launch-time `--matte-cache-root` argument,
+canonicalizes it, and rejects wire/project-controlled roots. It validates the manifest,
+receipt, containment, file type, byte bounds, and every named frame before admission.
+`structuralRevision` is monotonic and reserved for topology,
+resource, or compile-affecting publications; it is not advanced by slider,
+automation, or modulation values.
+`isAdjustment=true` explicitly declares a read-only `CompositeBelow` input;
+helpers still recognize the legacy `gen://adjustment` source sentinel while old
+projects migrate. Matte fields authoritatively identify the baked alpha sequence;
+preview, composite probes, and export derive the decoder pattern and start number
+from `matteFramePrefix`, `matteFrameExtension`, `matteFirstFrame`, and
+`matteFrameDigits` after revalidating the immutable cache immediately before open.
+This authority boundary protects against untrusted project and imported-media data.
+A process already compromised under the same OS principal can alter application state
+or race pathname opens and is outside application authority; this protocol does not
+claim protection against same-principal process compromise.
+`sourceKind` is one of `media|shader|particles|adjustment`. When present it is
+authoritative; `isAdjustment` and `gen://` sentinels are fallback-only readers.
+Likewise, transition `fromClipId`/`toClipId` are authoritative A/B owners.
+Same-track timeline-order inference runs only when both structured IDs are absent.
+
+Preview and export pass this wire shape through the same immutable
+`ResolvedVisualSnapshot` normalizer before either render path sees it. Snapshot
+construction is read-only: it does not promote legacy graphs, rewrite project
+state, or publish undoable mutations. Explicit invalid source, transition, matte,
+or timing bindings are rejected; compatibility inference is absence-only.
+
+The timeline acknowledgement and `graph_describe` diagnostics expose:
+`authoringRevision`, `acceptedRevision`, `rejectedRevision`, `compiledRevision`,
+`lastGoodRevision`, `exportableRevision`, and `evaluationSequence`. A runtime
+`graph_set_param` advances evaluation without advancing authoring/compiled state.
+New authoring immediately clears current exportability; rejection preserves the
+previous compiled/last-good revision but export must not silently use it.
+`composite_frame_probe` accepts one immutable processor-owned offline-export
+snapshot plus one `timelineSec` and bounded canvas dimensions. It returns the
+production offscreen compositor's exact RGBA8 readback, processor snapshot
+generation, per-clip authored structural revision and snapshot
+compiled/exportable validity, compositor backend, and readback presentation
+backend. It has no output/source path field and never opens a viewport. Every
+current authored clip plan must be valid in the snapshot; valid clips may carry
+unequal revisions. The live viewport helper's admission, last-good, rejection,
+or generation state is not authority for this RPC and is not claimed. Export,
+render-cache, or another probe makes the compositor deterministically busy. On
+macOS the compositor must report a native Metal backend and the
+presentation identity is `metal-iosurface-cpu-readback`; there is no OpenGL or
+CPU-renderer fallback. Other platforms report the offscreen OpenGL async
+readback explicitly.
 Arbit computes segments from the beat-marker mapping (`VideoBeatMath.h` is the
 single source of truth); the helper only evaluates
 `sourceSec = inSec + (displaySec − displayStartSec) × rate` for the segment
@@ -144,15 +241,17 @@ automation subParam packing are count-driven and unaffected by the bump.
 Text overlays are addressable as `text<id>/{opacity, posX, posY, translateX,
 translateY, visible, zOrder}` once registered via `text_set_image`.
 
-- `graph_set_param {paramId, value, atBeat?, interpolation?}` — immediate
+- `graph_set_param {paramId, value, atBeat?, interpolation?, runtimeRevision?}` — immediate
   when `atBeat` is omitted/negative; otherwise queued and applied when the
   playhead passes `atBeat`. `interpolation` accepts
   `linear|hold|ease_in|ease_out|ease_in_out` (keyframe vocabulary reserved;
   v1 applies values as steps). This is the hook Arbit automation lanes will
-  drive.
+  drive. `runtimeRevision` is a separate monotonic stream: accepting it never
+  requests graph validation or recompilation.
 - `graph_describe` — returns `{nodes:[{clipId, topology, params:{id:value}}]}`;
   v2 adds per-clip `effects:[{slot,type,enabled,params}]` and a top-level
-  `texts:[{textId, params}]`.
+  `texts:[{textId, params}]`; it also reports the latest accepted
+  `structuralRevision` and `runtimeRevision` for restart/debug inspection.
 - `graph_set_effects {clipId, effects:[{slot, type, enabled, params:{name:value}}]}`
   — bulk (re)configure a clip's whole rack in one call (add/remove/reorder).
   Individual sliders and automation use per-param `graph_set_param`.
@@ -374,8 +473,8 @@ finalizes attached recorders, and releases the preview ring.
 
 `viewport_info` (alias `get_av_offset`) returns:
 `{open, width, height, measuredFps, avOffsetSec, interpolationActive,
-interpolationBackend ("nearest"|"rife-cuda"), gpuPath, framesPresented,
-frameHash, gpu}`.
+interpolationBackend ("nearest"|"rife-cuda"), gpuPath, particleBackend,
+framesPresented, frameHash, gpu}`.
 
 - `avOffsetSec` = presented frame pts − ideal source time (target: < 1 frame).
 - `frameHash` = FNV-1a of the COMPOSITED output (first ~1 MB, read back
@@ -388,10 +487,11 @@ frameHash, gpu}`.
   maxComputeWorkGroupInvocations}`. The context is requested at GL 4.3 core
   (4.1 on macOS, which caps desktop GL there → `computeShaders:false`).
   `graph_describe` mirrors the same object under its top-level `gpu` key.
-  Compute-class features (GPU particles, on-GPU FFT) gate on
-  `computeShaders`; where false the export path flags the result rather than
-  failing. The version bump itself is a pure regression — `frameHash` for an
-  existing project is byte-identical to the pre-bump 3.3 baseline.
+  OpenGL compute features gate on `computeShaders`; where false they degrade
+  or report unavailable rather than crashing. Apple particle layers are the
+  exception: they use the native Metal backend and report that independently
+  through `particleBackend`, even though the compositor's GL 4.1 capability
+  snapshot correctly says `computeShaders:false`.
 
 ## Export (GL-composited, baked timeline)
 
@@ -434,11 +534,30 @@ generative-visuals-research.md risk 13). Ignored unless some clip uses
 `feedback_trail` and `startSec > 0`. Arbit supplies a beats-derived value
 (default 8 beats).
 
-**Tempo (shader generators).** `bpm` (default 120) and `beatsPerBar`
-(default 4) drive the Block A clock for shader-generator clips (§Shader
-generators). The clock is a pure function of display time + this constant
-tempo (v1: no tempo map), evaluated identically here and in the viewport, so
-a beat-synced shader exports exactly as it previews.
+**Tempo and meter.** `tempoMap[]` and `timeSignatureMap[]` drive every video
+clock consumer: shader uniforms, score packing, modulation, scripts, seeks,
+warm-up, and pending beat-stamped parameters. Linear tempo ramps use the exact
+integral/inverse mapping. `bpm` (default 120) and `beatsPerBar` (default 4)
+remain compatibility fallbacks when the arrays are absent. Export and viewport
+use the same evaluator, so a beat-synced result exports exactly as it previews.
+
+### Session Graph video Control plan
+
+`controlPlan` is the bounded executable projection of every supported Session
+Graph Control closure ending at a video parameter sink. The same object is
+embedded in export jobs and sent live with `viewport_set_control_plan`.
+
+- `version`: currently `1`.
+- `numSlots`: fixed scalar slot count.
+- `operations`: topologically ordered operations carrying exact input fan-in,
+  resolved parameters, output slots, and sink shaping metadata.
+- `diagnostics`: producer-side closure rejection messages.
+
+The helper rejects the complete plan for unknown kinds, non-finite parameters,
+out-of-range or multiply-owned slots, forward references, and capacity
+violations. It never truncates or approximates topology. Legacy flat
+`modMatrix` entries remain accepted for old projects; Graph-owned routes are
+sent through `controlPlan` only, preventing double application.
 
 **Async + progress + cancel.** `export` replies are DEFERRED: the helper
 parses the jobSpec, spawns a render worker and answers the request id only
@@ -602,9 +721,8 @@ export path** — all without any shader change beyond new prelude accessors):
 - **Block A — clock**: `uResolution` (vec2), `uTime`, `uTimeDelta`, `uFrame`
   (wall-clock, clip-relative); `uBeat` (timeline-absolute beat), `uBeatPhase`,
   `uBarPhase`, `uBPM`, `uBeatsPerBar`, `uClipBeat` (beats since clip start),
-  `uClipLength`, `uPlaying`. Derived from display time × the jobSpec
-  `bpm`/`beatsPerBar` (constant tempo, v1) — the SAME formula in the viewport
-  and the exporter, so a beat-synced shader exports exactly as it previews.
+  `uClipLength`, `uPlaying`. Derived from display time through the jobSpec
+  tempo/meter maps — the SAME evaluator in the viewport and exporter.
 - **Block B — audio features** (M4): `uRMS`, `uPeak`, `uOnset` (0..1 transient
   strength), `uOnsetAge` (seconds since the last onset), and the 64 log-spaced
   magnitudes `uAudioBands` (`sampler1D`, read via `arbitBand(b)`) plus its
@@ -628,8 +746,8 @@ export path** — all without any shader change beyond new prelude accessors):
   covers freed-row holes), `uLinkCount`, `uRootFreq` (Hz). In the **export
   path** the helper runs the in-house A2 packer (`block_c_packer.h`, the SAME
   voice allocator the live path will use) over the jobSpec `score` once per
-  frame at the frame's beat (`beat = displaySec · bpm / 60`, == the Block A
-  clock), in monotonic frame order. The packer is **stateful**: a note keeps its
+  frame at the frame's mapped beat (== the Block A clock), in monotonic frame
+  order. The packer is **stateful**: a note keeps its
   row for its whole residency (so age-/row-keyed effects don't jump), rows free
   and reuse on exit. To keep row assignment consistent across export modes the
   packer is **warmed from timeline frame 0** (a CPU-only catch-up on the first
@@ -725,7 +843,7 @@ the score packer — routing state is **warmed from timeline frame 0**: a
 frame-aligned mid-range export renders a given instant byte-identically to a
 from-the-top export (the same contract M5 guarantees, regression-guarded by the
 mod-matrix test's smoothed mid-range parity check). The clock beat is the
-**absolute timeline beat** (`t·bpm/60`, == the packer), so score-sourced routings
+**absolute mapped timeline beat** (== the packer), so score-sourced routings
 see the same onsets the packed `uNotes` do. Symbolic/clock/score sources warm
 exactly from frame 0; **audio**-derived sources only have features inside the
 export range (the mix WAV is range-scoped), so before `startSec` their audio is
@@ -734,6 +852,27 @@ per export. Discrete sources (`HarmRatioNum/Den`) bypass smoothing (integer jump
 read as intentional). GL path only.
 
 ## Lua hook (M8, agent-programmable per-frame)
+
+### Programmable-runtime session boundary
+
+Non-empty programmable source fields are accepted only with an authenticated,
+single-use `runtimeGrant`.  This applies to `shader_compile`, `script_compile`,
+`viewport_set_script`, `viewport_set_timeline`, `export`,
+`render_cache_build`, and `composite_frame_probe`, including programmable
+fields nested in both `segments` and `clips`.  Missing, forged, wrong-kind,
+stale-session, stale-time, and replayed grants fail closed before execution.
+
+On POSIX the plugin sends exactly 40 private bytes (32-byte secret followed by
+an eight-byte big-endian generation) over inherited descriptor 3.  The helper
+reads it once and closes the descriptor; it is never an argument, environment
+variable, RPC field, persisted state, or log value.  Unique authenticated
+nonces may arrive out of issue order, while each nonce is consumed at most
+once.  Helper replacement always creates new session material and invalidates
+all old grants.  Automatic blind helper restart is disabled.
+
+Windows intentionally reports this capability as unavailable and refuses a
+helper launch configured with private grant material.  There is no argv,
+environment, or ordinary inherited-handle fallback.
 
 *The general case of the mod matrix.* Where a routing maps one source through one
 curve to one destination, the `luaScript` jobSpec field (§Export) is a
