@@ -8,7 +8,7 @@ root = Path(sys.argv[1]).resolve()
 cmake = (root / "CMakeLists.txt").read_text()
 rife = (root / "src/rife_net/rife.cpp").read_text()
 engine = (root / "src/rife_ncnn.cpp").read_text()
-blocker = (root.parent / "artifacts/media-machine/rife-ncnn-async-submission-blocker.md").read_text()
+blocker = (root.parent / "artifacts/planning/research-only/media-machine/rife-ncnn-async-submission-blocker.md").read_text()
 
 assert 'set(_arbit_zerocopy_default OFF)' in cmake
 assert 'if(ARBIT_NCNN_ZEROCOPY)\n    message(FATAL_ERROR' in cmake

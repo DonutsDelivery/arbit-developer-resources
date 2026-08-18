@@ -2806,23 +2806,40 @@ int main (int argc, char** argv)
     std::vector<char> line;
 #if defined(__APPLE__) && ARBIT_HAVE_VIEWPORT
     // Keep AppKit event routing on the process main thread while stdin remains
-    // responsive. stdio may already have buffered another JSON line, so check
-    // its stream buffer before waiting on the underlying descriptor.
-    while (true)
+    // responsive. Read the raw descriptor directly: std::cin is buffered and
+    // its filebuf can read past a newline into its own buffer, which leaves
+    // poll(STDIN_FILENO) watching an empty pipe while a complete request line
+    // sits unread in the stream buffer, stalling the loop until EOF.
     {
-        g_viewport.processWindowEvents();
-        if (std::cin.rdbuf()->in_avail() <= 0)
+        std::string pending;
+        char chunk[4096];
+        while (true)
         {
+            g_viewport.processWindowEvents();
             pollfd input { STDIN_FILENO, POLLIN, 0 };
             const int ready = poll (&input, 1, 8);
             if (ready < 0 || ready == 0)
                 continue;
             if ((input.revents & (POLLIN | POLLHUP)) == 0)
                 break;
+            const ssize_t n = ::read (STDIN_FILENO, chunk, sizeof (chunk));
+            if (n <= 0)
+                break;
+            pending.append (chunk, static_cast<size_t> (n));
+            if (pending.size() > kMaxStdinLineBytes)
+            {
+                replyError (nullptr, "request line exceeds 16 MiB cap");
+                break;
+            }
+            size_t newlinePos = 0;
+            while ((newlinePos = pending.find ('\n')) != std::string::npos)
+            {
+                const std::string oneLine = pending.substr (0, newlinePos);
+                pending.erase (0, newlinePos + 1);
+                if (! oneLine.empty())
+                    processRequest (oneLine.data(), oneLine.size());
+            }
         }
-        if (! readBoundedLine (line))
-            break;
-        if (! line.empty()) processRequest (line.data(), line.size());
     }
 #else
     while (readBoundedLine (line))

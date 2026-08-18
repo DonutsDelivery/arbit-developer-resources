@@ -4,7 +4,7 @@
 // entry points; everything modern (shaders, VAOs, FBOs, PBOs) must be
 // resolved at runtime from the driver. GLFW is already the platform layer,
 // so the loader uses glfwGetProcAddress — no GLAD/GLEW vendoring (decision
-// documented in artifacts/video-parity/verify-gl.md). Function-pointer
+// documented in artifacts/planning/missing-features/plans/video-parity/verify-gl.md). Function-pointer
 // typedefs come from the Khronos <GL/glext.h> shipped with the GL headers.
 //
 // GL 1.1 functions (glTexImage2D, glClear, glDrawElements, glReadPixels, …)

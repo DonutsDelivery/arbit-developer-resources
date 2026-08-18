@@ -2,7 +2,7 @@
 // viewport (realtime preview) and, later, the exporter (WP6 offline path).
 //
 // Faithful C++/GLSL-330 port of the reference editor's GPU compositor
-// (artifacts/video-parity/compositor-spec.md, effects-spec.md,
+// (artifacts/planning/missing-features/plans/video-parity/compositor-spec.md, effects-spec.md,
 // overlay-fx-spec.md §transitions). Per output frame:
 //
 //   for each layer (ordered by caller: trackLayer, then zOrder):

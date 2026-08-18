@@ -27,6 +27,7 @@
  #include <cerrno>
  #include <ctime>
  #include <fcntl.h>
+ #include <poll.h>
  #include <sys/socket.h>
  #include <sys/stat.h>
  #include <sys/un.h>
@@ -172,6 +173,13 @@ bool FdSocketServer::listen (std::string& pathOut, std::string& errorOut)
         return false;
     }
 
+#if ! defined (__linux__)
+    // poll() calls accept() directly on macOS and Windows. Keep the listening
+    // socket non-blocking so the render loop can finish opening the shared
+    // viewport before a consumer connects.
+    setNonBlocking (listenFd_);
+#endif
+
     pathOut = path_;
     return true;
 }
@@ -194,6 +202,9 @@ bool FdSocketServer::poll()
     setNonBlocking (clientFd_);
     rxBuf_.clear();
 #else
+    pollfd readiness { (int) listenFd_, POLLIN, 0 };
+    if (::poll (&readiness, 1, 0) <= 0 || (readiness.revents & POLLIN) == 0)
+        return false;
     const int fd = ::accept ((int) listenFd_, nullptr, nullptr);
     if (fd < 0)
         return false;

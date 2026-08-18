@@ -267,7 +267,7 @@ endif()
 # (Tencent, BSD-3) is fetched. ncnn 20250503 is PINNED on purpose: it is the
 # newest release that still defines the afpvec8 packed-fp16 shader type +
 # Option::use_shader_pack8 that the 2022-era net source uses (both removed by
-# ncnn 20251225). See artifacts/media-machine/rife-ncnn-vulkan-plan.md.
+# ncnn 20251225). See artifacts/planning/missing-features/plans/media-machine/rife-ncnn-vulkan-plan.md.
 # ncnn's SIMPLEVK path expects a Vulkan loader symbol at link time on macOS.
 # MoltenVK satisfies that (see Apple branch below). Default ON everywhere so
 # the shipped helper includes Speed Warp; configure -DARBIT_WITH_NCNN=OFF to
@@ -289,7 +289,7 @@ if(ARBIT_NCNN_ZEROCOPY)
         "ARBIT_NCNN_ZEROCOPY is blocked: pinned ncnn 20250503 exposes only "
         "VkCompute::submit_and_wait(), so external wait/signal semaphores and "
         "per-submission completion cannot be attached legally. See "
-        "artifacts/media-machine/rife-ncnn-async-submission-blocker.md.")
+        "artifacts/planning/research-only/media-machine/rife-ncnn-async-submission-blocker.md.")
 endif()
 if(ARBIT_WITH_NCNN)
     include(FetchContent)
