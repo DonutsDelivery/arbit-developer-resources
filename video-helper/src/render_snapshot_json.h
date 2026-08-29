@@ -38,6 +38,8 @@ bool parseSnapshotJson (const Json& object, ShaderResolver&& resolveShader,
             segment.outSec = value.value ("outSec", 0.0);
             segment.rate = value.value ("rate", 1.0);
             segment.displayStartSec = value.value ("displayStartSec", 0.0);
+            segment.clockStartSec = value.value ("clockStartSec", -1.0);
+            segment.clockDurationSec = value.value ("clockDurationSec", 0.0);
 
             segment.retimeQuality = value.value ("retimeQuality", 0);
             segment.sourceFps = value.value ("sourceFps", 0.0);

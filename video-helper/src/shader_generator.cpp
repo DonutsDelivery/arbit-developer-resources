@@ -132,6 +132,8 @@ void ShaderGenerator::cacheLocs (const arbitgl::GlFuncs* gl, unsigned prog)
     locs_.uLinks        = L ("uLinks");
     locs_.uNoteCount    = L ("uNoteCount");
     locs_.uLinkCount    = L ("uLinkCount");
+    locs_.uScoreHistoryBeats = L ("uScoreHistoryBeats");
+    locs_.uScoreLookaheadBeats = L ("uScoreLookaheadBeats");
     locs_.uLastOnsetBeat= L ("uLastOnsetBeat");
     locs_.uRootFreq     = L ("uRootFreq");
     locs_.uChord        = L ("uChord");
@@ -452,6 +454,10 @@ unsigned ShaderGenerator::render (const arbitgl::GlFuncs* gl, const ShaderClock&
     if (locs_.uNoteCount    >= 0) gl->Uniform1i (locs_.uNoteCount, haveNotes ? notes->noteCount : 0);
     if (locs_.uLinkCount    >= 0) gl->Uniform1i (locs_.uLinkCount, haveNotes ? notes->linkCount : 0);
     if (locs_.uRootFreq     >= 0) gl->Uniform1f (locs_.uRootFreq, haveNotes ? notes->rootFreq : 0.0f);
+    if (locs_.uScoreHistoryBeats >= 0)
+        gl->Uniform1f (locs_.uScoreHistoryBeats, haveNotes ? notes->historyBeats : 0.0f);
+    if (locs_.uScoreLookaheadBeats >= 0)
+        gl->Uniform1f (locs_.uScoreLookaheadBeats, haveNotes ? notes->lookaheadBeats : 0.0f);
     // uLastOnsetBeat / uChord stay reserved (in Locs, not in the v1 prelude) —
     // a later slice can fill them without a contract change.
     if (locs_.uLastOnsetBeat>= 0) gl->Uniform1f (locs_.uLastOnsetBeat, 0.0f);

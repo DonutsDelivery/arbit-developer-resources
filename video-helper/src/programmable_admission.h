@@ -177,7 +177,9 @@ inline programmableruntime::PayloadKind identifyCatalogGpuPayload (
 inline bool admitsGpuPayload (const programmableruntime::Grant& grant,
                               programmableruntime::PayloadKind kind, std::string& error)
 {
-    if (kind != programmableruntime::PayloadKind::shader || ! grant.verifiedBundledCurated)
+    if ((kind != programmableruntime::PayloadKind::shader
+         && kind != programmableruntime::PayloadKind::isf)
+        || ! grant.verifiedBundledCurated)
     {
         error = "sandbox unavailable";
         return false;

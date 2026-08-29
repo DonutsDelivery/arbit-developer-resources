@@ -976,8 +976,6 @@ int main (int argc, char** argv)
     videorender::LayerDesc shaderLayer;
     shaderLayer.clipId = 88;
     shaderLayer.shaderSource = true;
-    shaderLayer.texWidth = width;
-    shaderLayer.texHeight = height;
     shaderLayer.shaderClock.timeSec = 1.0;
     shaderLayer.effects = &invert;
     shaderLayer.effectCount = 1;
@@ -1001,6 +999,11 @@ int main (int argc, char** argv)
     const std::array<uint8_t, 4> shaderPixel = {
         bytes[metalOnlyCenter + 2], bytes[metalOnlyCenter + 1],
         bytes[metalOnlyCenter], bytes[metalOnlyCenter + 3] };
+    const size_t shaderInterior = static_cast<size_t> (height / 2) * metalOnlyRowBytes
+                                + static_cast<size_t> (width / 8) * 4;
+    const std::array<uint8_t, 4> shaderInteriorPixel = {
+        bytes[shaderInterior + 2], bytes[shaderInterior + 1],
+        bytes[shaderInterior], bytes[shaderInterior + 3] };
     IOSurfaceUnlock (metalOnlySurface, kIOSurfaceLockReadOnly, nullptr);
     directRenderer.clearClipShader (88);
     directRenderer.clearDirectOutputs();
@@ -1029,6 +1032,15 @@ int main (int argc, char** argv)
                   << static_cast<int> (shaderPixel[1]) << ','
                   << static_cast<int> (shaderPixel[2]) << ','
                   << static_cast<int> (shaderPixel[3]) << '\n';
+        return 1;
+    }
+    if (! isGreen (shaderInteriorPixel))
+    {
+        std::cerr << "Native Metal generator did not fill the canvas; interior RGBA="
+                  << static_cast<int> (shaderInteriorPixel[0]) << ','
+                  << static_cast<int> (shaderInteriorPixel[1]) << ','
+                  << static_cast<int> (shaderInteriorPixel[2]) << ','
+                  << static_cast<int> (shaderInteriorPixel[3]) << '\n';
         return 1;
     }
 

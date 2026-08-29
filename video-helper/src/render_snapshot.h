@@ -26,6 +26,8 @@ struct RenderSegment
     double outSec = 0.0;
     double rate = 1.0;
     double displayStartSec = 0.0;
+    double clockStartSec = -1.0;
+    double clockDurationSec = 0.0;
 
     int retimeQuality = 0;
     int transitionType = 0;
@@ -425,6 +427,10 @@ inline bool normalizeSnapshot (std::vector<RawRenderSegment> raw,
         }
         if (! std::isfinite(segment.inSec) || ! std::isfinite(segment.outSec)
             || ! std::isfinite(segment.rate) || ! std::isfinite(segment.displayStartSec)
+            || ! std::isfinite(segment.clockStartSec) || ! std::isfinite(segment.clockDurationSec)
+            || (segment.clockStartSec < 0.0 && segment.clockStartSec != -1.0)
+            || segment.clockDurationSec < 0.0
+            || (segment.clockStartSec >= 0.0 && segment.clockDurationSec <= 0.0)
             || segment.outSec < segment.inSec || segment.rate <= 0.0)
         {
             error = "snapshot segment has invalid timing";
@@ -461,10 +467,26 @@ inline bool normalizeSnapshot (std::vector<RawRenderSegment> raw,
             error = "matte asset state has no stable owner";
             return false;
         }
-        if (std::any_of(candidate.segments.begin(), candidate.segments.end(),
-                        [&segment](const RenderSegment& prior) { return prior.clipId == segment.clipId; }))
+        const auto duplicateOwner = std::find_if(
+            candidate.segments.begin(), candidate.segments.end(),
+            [&segment](const RenderSegment& prior)
+            {
+                if (prior.clipId != segment.clipId)
+                    return false;
+                if (prior.trackLayer != segment.trackLayer
+                    || prior.sourceKind != segment.sourceKind
+                    || prior.isAdjustment != segment.isAdjustment)
+                    return true;
+                const double priorEnd = prior.displayStartSec
+                    + (prior.outSec - prior.inSec) / std::max(prior.rate, 1.0e-9);
+                const double segmentEnd = segment.displayStartSec
+                    + (segment.outSec - segment.inSec) / std::max(segment.rate, 1.0e-9);
+                return segment.displayStartSec < priorEnd - 1.0e-9
+                    && prior.displayStartSec < segmentEnd - 1.0e-9;
+            });
+        if (duplicateOwner != candidate.segments.end())
         {
-            error = "snapshot duplicates a stable clip owner";
+            error = "snapshot duplicates or overlaps a stable clip owner";
             return false;
         }
 
@@ -489,7 +511,8 @@ inline bool normalizeSnapshot (std::vector<RawRenderSegment> raw,
                     candidate.segments.begin(), candidate.segments.end(),
                     [&segment] (const RenderSegment& other)
                     { return other.clipId == segment.transitionFromClipId; });
-                if (found == candidate.segments.end())
+                if (segment.transitionFromClipId != 0
+                    && found == candidate.segments.end())
                 {
                     error = "explicit transition source is missing";
                     return false;

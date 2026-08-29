@@ -147,7 +147,10 @@ public:
                                  std::vector<std::string>& outPaths);
 
 private:
+    static AVPixelFormat getHwFormat (AVCodecContext* context,
+                                      const AVPixelFormat* formats);
     std::string decodeForwardUntil (double targetSec, AVFrame* frame, bool& gotFrame);
+    std::string reopenSoftwareVideoDecoder (double targetSec);
     std::string scaleToRgba (AVFrame* frame, int maxW, int maxH, DecodedFrame& out);
     std::string decodeAudioMono (int targetRate, std::vector<float>& monoOut);
     bool openAudioDecoder (std::string& error);
@@ -159,8 +162,10 @@ private:
     MediaInfo info_;
     AVFormatContext* fmt_ = nullptr;
     AVCodecContext* videoDec_ = nullptr;
+    const AVCodec* softwareVideoCodec_ = nullptr;
     AVBufferRef* hwDeviceCtx_ = nullptr;   // non-null when hardware decode is active
     AVPixelFormat hwPixFmt_ = AV_PIX_FMT_NONE;
+    std::atomic<bool> hardwareFallbackRequested_ { false };
     AVFrame* hwTransferFrame_ = nullptr;   // staging frame for hw->sw download
     AVCodecContext* audioDec_ = nullptr;
     SwsContext* sws_ = nullptr;

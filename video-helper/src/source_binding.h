@@ -10,6 +10,7 @@ enum class SourceKind
     Media,
     Shader,
     Particles,
+    Score,
     Adjustment,
 };
 
@@ -18,6 +19,7 @@ inline SourceKind sourceKindFromWire (const std::string& value) noexcept
     if (value == "media")      return SourceKind::Media;
     if (value == "shader")     return SourceKind::Shader;
     if (value == "particles")  return SourceKind::Particles;
+    if (value == "score")      return SourceKind::Score;
     if (value == "adjustment") return SourceKind::Adjustment;
     return SourceKind::Unspecified;
 }
@@ -29,6 +31,7 @@ inline const char* sourceKindToWire (SourceKind value) noexcept
         case SourceKind::Media:      return "media";
         case SourceKind::Shader:     return "shader";
         case SourceKind::Particles:  return "particles";
+        case SourceKind::Score:      return "score";
         case SourceKind::Adjustment: return "adjustment";
         default:                     return "unspecified";
     }
@@ -48,6 +51,8 @@ inline SourceKind resolveSourceKind (SourceKind structuredKind,
         return SourceKind::Adjustment;
     if (legacyPath.rfind ("gen://particles", 0) == 0)
         return SourceKind::Particles;
+    if (legacyPath.rfind ("gen://score", 0) == 0)
+        return SourceKind::Score;
     if (legacyPath.rfind ("gen://shader", 0) == 0)
         return SourceKind::Shader;
     return SourceKind::Media;

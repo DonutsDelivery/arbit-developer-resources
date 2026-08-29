@@ -270,8 +270,10 @@ MediaContext* findMedia (const json& params, std::string& error)
 //   paramTimeline: [{paramId, atSec, value}] (baked automation;
 //     paramId namespace: clip<id>/<node>/<param> or text<id>/<param>,
 //     where <node> includes gen for ISF INPUTS: clip<id>/gen/<name>)
-//   score: {rootFreq, lookaheadBeats?, notes:[{id, trackId, startBeat,
-//     lengthBeats, midiNote, velocity, freqHz, ratioNum, ratioDen,
+//   score: {rootFreq, historyBeats?, lookaheadBeats?, notes:[{id, trackId, startBeat,
+//     lengthBeats, midiNote, velocity, freqHz, durationSeconds, pitchBendPoints,
+//     pitchAnchors,
+//     ratioNum, ratioDen,
 //     primes:[e2,e3,e5,e7,e11,e13], linkMasterId, isRoot}],
 //     links:[{id, slaveNoteId, masterNoteId, slaveHarmonic, masterHarmonic,
 //     octaveTranspose}]} — Block C (M5): packed per frame into uNotes/uLinks
@@ -344,13 +346,19 @@ static arbitmod::LFOShape parseLfoShape (const std::string& s)
 }
 
 // Parse a `score` object (M5 Block C wire schema, documented at the top of
-// parseExportJob) into an arbitmod::Score + lookahead. Shared by the export job
+// parseExportJob) into an arbitmod::Score. Shared by the export job
 // parser and the viewport_set_score RPC so the export and live-preview paths
 // can never disagree on the note/link schema.
-static void parseScoreJson (const json& sc, arbitmod::Score& score, double& lookaheadBeats)
+static void parseScoreJson (const json& sc, arbitmod::Score& score)
 {
+    score.notationVersion = sc.value("notationVersion", 1);
+    score.scoreRevision = sc.value("scoreRevision", uint64_t { 0 });
+    score.edoStepsPerOctave = std::max(1, sc.value("edoStepsPerOctave", 12));
     score.rootFreq = sc.value ("rootFreq", 261.625565f);
-    lookaheadBeats = sc.value ("lookaheadBeats", 4.0);
+    score.historyBeats = std::max (0.0f, sc.value (
+        "historyBeats", arbitmod::kDefaultScoreHistoryBeats));
+    score.lookaheadBeats = std::max (0.0f, sc.value (
+        "lookaheadBeats", arbitmod::kDefaultScoreLookaheadBeats));
     if (sc.contains ("notes"))
         for (const auto& n : sc["notes"])
         {
@@ -362,10 +370,50 @@ static void parseScoreJson (const json& sc, arbitmod::Score& score, double& look
             nt.midiNote     = n.value ("midiNote", 60.0f);
             nt.velocity     = n.value ("velocity", 100.0f);
             nt.freqHz       = n.value ("freqHz", 261.625565f);
+            nt.durationSeconds = n.value ("durationSeconds", 0.0f);
+            if (n.contains ("pitchBendPoints") && n["pitchBendPoints"].is_array())
+                for (const auto& point : n["pitchBendPoints"])
+                {
+                    arbitmod::PitchBendPoint bend;
+                    bend.position = point.value ("position", 0.0f);
+                    bend.semitones = point.value ("semitones", 0.0f);
+                    bend.tension = point.value ("tension", 0.0f);
+                    bend.sCurve = point.value ("sCurve", 0.0f);
+                    bend.vibratoDepthCents = point.value ("vibratoDepthCents", 0.0f);
+                    bend.vibratoRateHz = point.value ("vibratoRateHz", 0.0f);
+                    bend.vibratoWaveform = point.value ("vibratoWaveform", 0);
+                    bend.vibratoFadeIn = point.value ("vibratoFadeIn", 0.0f);
+                    bend.vibratoFadeOut = point.value ("vibratoFadeOut", 0.0f);
+                    nt.pitchBendPoints.push_back (bend);
+                }
+            if (n.contains ("pitchAnchors") && n["pitchAnchors"].is_array())
+                for (const auto& anchor : n["pitchAnchors"])
+                    nt.pitchAnchors.push_back ({
+                        anchor.value ("id", -1),
+                        anchor.value ("position", 0.0f),
+                        anchor.value ("frequency", 0.0f) });
             nt.ratioNum     = n.value ("ratioNum", 1);
             nt.ratioDen     = n.value ("ratioDen", 1);
             nt.linkMasterId = n.value ("linkMasterId", -1);
             nt.isRoot       = n.value ("isRoot", false);
+            nt.centsOffset = n.value("centsOffset", 0.0f);
+            nt.edoStep = n.value("edoStep", -1);
+            nt.muted = n.value("muted", false);
+            nt.notationVisible = n.value("notationVisible", ! nt.muted);
+            nt.diatonicIndex = n.value("diatonicIndex", 28);
+            nt.baseAccidental = n.value("baseAccidental", 0);
+            nt.linked = n.value("linked", false);
+            nt.hasUnmappedPrime = n.value("hasUnmappedPrime", false);
+            nt.edoActive = n.value("edoActive", false);
+            nt.edoInflection = n.value("edoInflection", 0);
+            nt.edoDegree = n.value("edoDegree", 0);
+            if (n.contains("commas") && n["commas"].is_array())
+                for (const auto& comma : n["commas"])
+                {
+                    if (nt.commaCount >= static_cast<int>(nt.commas.size())) break;
+                    nt.commas[static_cast<size_t>(nt.commaCount++)] = {
+                        comma.value("prime", 0), comma.value("exponent", 0) };
+                }
             if (n.contains ("primes") && n["primes"].is_array())
                 for (size_t i = 0; i < n["primes"].size() && i < 6; ++i)
                     if (n["primes"][i].is_number())
@@ -818,7 +866,7 @@ std::string parseExportJob (const json& params, ExportJob& job)
     // Block C symbolic score (M5). Parsed unconditionally (the GL frame loop is
     // the only consumer); mod_defs.h is plain C++17, no GL/GPL.
     if (params.contains ("score") && params["score"].is_object())
-        parseScoreJson (params["score"], job.score, job.scoreLookaheadBeats);
+        parseScoreJson (params["score"], job.score);
 
     // Cross-domain modulation matrix (M6). Each routing maps a musical source
     // (Block A clock / Block B audio / Block C score) onto a render-graph clip
@@ -2014,6 +2062,15 @@ json handle (const std::string& method, const json& params, std::string& error)
         return json { { "ok", true } };
     }
 
+    if (method == "viewport_set_view")
+    {
+        error = g_viewport.setView (params.value ("zoom", 1.0),
+                                    params.value ("panX", 0.0),
+                                    params.value ("panY", 0.0));
+        if (! error.empty()) return {};
+        return json { { "ok", true } };
+    }
+
     if (method == "viewport_set_canvas_frame_enabled")
     {
         g_viewport.setCanvasFrameEnabled (params.value ("enabled", true));
@@ -2190,12 +2247,11 @@ json handle (const std::string& method, const json& params, std::string& error)
         // M5 Block C live score: same wire schema as the export jobSpec's
         // `score`. Empty/absent ⇒ clears the live score (shaders zero-feed).
         arbitmod::Score score;
-        double lookahead = 4.0;
         if (params.contains ("score") && params["score"].is_object())
-            parseScoreJson (params["score"], score, lookahead);
+            parseScoreJson (params["score"], score);
         else if (params.contains ("notes") || params.contains ("rootFreq"))
-            parseScoreJson (params, score, lookahead); // flat form
-        g_viewport.setScore (std::move (score), lookahead);
+            parseScoreJson (params, score); // flat form
+        g_viewport.setScore (std::move (score));
         return json { { "ok", true } };
     }
 
@@ -2357,13 +2413,26 @@ json handle (const std::string& method, const json& params, std::string& error)
         const std::string source = params.value ("source", std::string());
         programmableruntime::Grant runtimeGrant;
         const auto grantIt=params.find("runtimeGrant");
-        if(!source.empty() && (grantIt==params.end()
-            || !programmableadmission::admit(*grantIt,
-                programmableruntime::PayloadKind::shader,source,runtimeGrant,error)))
-        { if(error.empty()) error="missing or invalid runtimeGrant"; return {}; }
-        if (! source.empty() && ! programmableadmission::admitsGpuPayload(
-                runtimeGrant, programmableruntime::PayloadKind::shader, error))
-            return {};
+        if (! source.empty())
+        {
+            if (grantIt == params.end()
+                || ! programmableadmission::parseGrant(*grantIt, runtimeGrant, error))
+            {
+                if (error.empty()) error="missing or invalid runtimeGrant";
+                return {};
+            }
+            if (runtimeGrant.verifiedBundledCurated)
+            {
+                if (! programmableadmission::admitCatalogGpuField(
+                        params, "source", "runtimeGrant", runtimeGrant, error))
+                    return {};
+            }
+            else if (! programmableadmission::admit(*grantIt,
+                         programmableruntime::PayloadKind::shader, source, runtimeGrant, error)
+                     || ! programmableadmission::admitsGpuPayload(
+                         runtimeGrant, programmableruntime::PayloadKind::shader, error))
+                return {};
+        }
         // P3: lower Slang / SPIR-V to GLSL at the GL-free front door, then run
         // the existing dialect wrap on the lowered GLSL (a bare-GLSL shader).
         const auto lang = arbitshadercompile::langFromWire (params.value ("lang", std::string()));

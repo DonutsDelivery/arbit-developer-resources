@@ -230,6 +230,40 @@ namespace detail
         return false;
     }
 
+    // True when source code declares a function with the requested return type,
+    // name, and first parameter type. Calls are deliberately not matched.
+    inline bool hasFunctionDefinitionCode (const std::string& src,
+                                           const std::string& returnType,
+                                           const std::string& name,
+                                           const std::string& firstParamType)
+    {
+        std::vector<std::string> tokens;
+        const size_t n = src.size();
+        for (size_t i = 0; i < n; )
+        {
+            if (i + 1 < n && src[i] == '/' && src[i + 1] == '/')
+            { while (i < n && src[i] != '\n') ++i; continue; }
+            if (i + 1 < n && src[i] == '/' && src[i + 1] == '*')
+            { i += 2; while (i + 1 < n && !(src[i] == '*' && src[i + 1] == '/')) ++i; i += 2; continue; }
+            if ((src[i] >= 'A' && src[i] <= 'Z') || (src[i] >= 'a' && src[i] <= 'z') || src[i] == '_')
+            {
+                const size_t start = i++;
+                while (i < n && isIdentChar (src[i])) ++i;
+                tokens.emplace_back (src.substr (start, i - start));
+            }
+            else
+            {
+                if (src[i] == '(') tokens.emplace_back ("(");
+                ++i;
+            }
+        }
+        for (size_t i = 0; i + 3 < tokens.size(); ++i)
+            if (tokens[i] == returnType && tokens[i + 1] == name
+                && tokens[i + 2] == "(" && tokens[i + 3] == firstParamType)
+                return true;
+        return false;
+    }
+
     // True if a preprocessor directive `#<ws>?keyword` appears outside comments.
     // Preprocessor-aware: matches "#extension", "# extension", "#\textension"
     // (GLSL/C permit whitespace between '#' and the directive keyword), with a
@@ -359,19 +393,23 @@ namespace detail
             "uResolution","uTime","uTimeDelta","uFrame","uBeat","uBPM","uBeatPhase",
             "uBarPhase","uBeatsPerBar","uClipBeat","uClipLength","uPlaying",
             "uRMS","uPeak","uOnset","uOnsetAge","uAudioBands","uAudioBands2D",
-            "uNotes","uLinks","uNoteCount","uLinkCount","uRootFreq","fragColor",
+            "uNotes","uLinks","uNoteCount","uLinkCount","uRootFreq",
+            "uScoreHistoryBeats","uScoreLookaheadBeats","fragColor",
             // Block D camera uniforms (P5)
             "uCamPos","uCamTarget","uCamUp","uCamFov","uCamNear","uCamFar",
             // helpers
             "arbitBand","hsv2rgb","beatPulse","arbitGuard","arbitCameraRay",
+            "arbitDisplayFragCoord","arbitTextureCoord",
             // Block C accessors (M5)
             "arbitNoteTexel","arbitNoteMidi","arbitNoteVel","arbitNoteAge","arbitNoteRemain",
+            "arbitNoteLength","arbitNoteStartOffset","arbitNoteEndOffset",
             "arbitNoteFreq","arbitNoteCents","arbitNoteTrack","arbitNoteIsRoot","arbitNotePrimesLo",
-            "arbitNotePrimesHi","arbitNoteMasterRow","arbitNoteActive","arbitLink","arbitLinkRatio",
+            "arbitNotePrimesHi","arbitNoteMasterRow","arbitNotePitch","arbitNoteBend",
+            "arbitNoteActive","arbitLink","arbitLinkRatio",
             "arbitLinkTexel","arbitNote","lattice2","ArbitNote","ArbitLink",
             // ISF auto-var macro targets / Shadertoy alias targets
-            "TIME","TIMEDELTA","FRAMEINDEX","RENDERSIZE","isf_FragNormCoord",
-            "IMG_PIXEL","IMG_NORM_PIXEL","IMG_SIZE",
+            "TIME","TIMEDELTA","FRAMEINDEX","RENDERSIZE","DATE","isf_FragNormCoord",
+            "IMG_PIXEL","IMG_NORM_PIXEL","IMG_THIS_PIXEL","IMG_SIZE",
             "iTime","iTimeDelta","iFrame","iResolution","iChannel0","iMouse",
             // builtins the contract relies on
             "texture","texture2D","main",
@@ -546,7 +584,7 @@ inline IsfHeader parseIsfHeader (const std::string& src)
 // ---------------------------------------------------------------------------
 // The fixed Arbit prelude (§4.1-4.4).
 // ---------------------------------------------------------------------------
-inline std::string arbitPrelude (Dialect dialect, const IsfHeader* isf)
+inline std::string arbitPrelude (Dialect dialect, const IsfHeader* isf, bool includeHsv2Rgb)
 {
     std::string p;
     p += "#version 330 core\n";
@@ -574,6 +612,8 @@ inline std::string arbitPrelude (Dialect dialect, const IsfHeader* isf)
     p += "uniform int   uNoteCount;\n";
     p += "uniform int   uLinkCount;\n";
     p += "uniform float uRootFreq;          // Block C: song root frequency in Hz\n";
+    p += "uniform float uScoreHistoryBeats; // Block C: visible beats behind playhead\n";
+    p += "uniform float uScoreLookaheadBeats; // Block C: visible beats ahead\n";
     // --- Block D: camera (3D / SDF raymarch, P5) ---
     // Contract uniforms readable by ANY shader; a Raymarch generator clip ships
     // uCamPos/uCamTarget/uCamFov as genParams so the camera automates + mod-routes
@@ -592,35 +632,48 @@ inline std::string arbitPrelude (Dialect dialect, const IsfHeader* isf)
     p += "#define texture2D texture\n";
     p += "#define gl_FragColor fragColor   // legacy ES/120 output shim (330 core removed gl_FragColor)\n";
     p += "float arbitBand(float b){ return texture(uAudioBands, clamp((b+0.5)/64.0,0.0,1.0)).r; }\n";
-    p += "vec3 hsv2rgb(vec3 c){ vec4 K=vec4(1.0,2.0/3.0,1.0/3.0,3.0);"
-         " vec3 q=abs(fract(c.xxx+K.xyz)*6.0-K.www);"
-         " return c.z*mix(K.xxx,clamp(q-K.xxx,0.0,1.0),c.y); }\n";
-    p += "float beatPulse(float width){ return smoothstep(width,0.0,uBeatPhase); }\n";
+    if (includeHsv2Rgb)
+        p += "vec3 hsv2rgb(vec3 c){ vec4 K=vec4(1.0,2.0/3.0,1.0/3.0,3.0);"
+             " vec3 q=abs(fract(c.xxx+K.xyz)*6.0-K.www);"
+             " return c.z*mix(K.xxx,clamp(q-K.xxx,0.0,1.0),c.y); }\n";
+    p += "float beatPulse(float width){ float d=min(uBeatPhase,1.0-uBeatPhase);"
+         " return 1.0-smoothstep(0.0,max(width,1e-4),d); }\n";
     p += "vec4 arbitGuard(vec4 c){ for(int i=0;i<4;i++){ if(isnan(c[i])||isinf(c[i])) c[i]=0.0; } return clamp(c,0.0,1.0); }\n";
+    // Generator targets enter a compositor whose row zero is the displayed top
+    // row. Present user shaders with the usual bottom-left GLSL/Shadertoy
+    // coordinate system despite that storage convention. Keep texture helpers
+    // in displayed-image space as well, so ISF image inputs stay upright.
+    p += "vec4 arbitDisplayFragCoord(){ return vec4(gl_FragCoord.x,uResolution.y-gl_FragCoord.y,gl_FragCoord.zw); }\n";
+    p += "vec2 arbitTextureCoord(vec2 q){ return vec2(q.x/uResolution.x,1.0-q.y/uResolution.y); }\n";
     // Block C symbolic accessors (M5): read the packed score. uNotes is a
     // 4-texel x 128-row RGBA32F texture (texelFetch by [texel,row]); uLinks is
     // 256x1. Loop `for(int i=0;i<uNoteCount;i++)` — holes (freed rows) read back
     // velocity 0 and gate to nothing via arbitNoteActive.
     p += "vec4  arbitNoteTexel(int row,int texel){ return texelFetch(uNotes, ivec2(texel,row), 0); }\n";
-    p += "float arbitNoteMidi(int row){ return arbitNoteTexel(row,0).r; }\n";        // MIDI note (float)
+    p += "float arbitNoteMidi(int row){ return arbitNoteTexel(row,0).r; }\n";        // authored MIDI note (float)
     p += "float arbitNoteVel(int row){ return arbitNoteTexel(row,0).g; }\n";         // velocity 0..1
     p += "float arbitNoteAge(int row){ return arbitNoteTexel(row,0).b; }\n";         // beats since onset (<0 = upcoming)
     p += "float arbitNoteRemain(int row){ return arbitNoteTexel(row,0).a; }\n";      // beats until note end
-    p += "float arbitNoteFreq(int row){ return arbitNoteTexel(row,1).r; }\n";        // Hz
-    p += "float arbitNoteCents(int row){ return arbitNoteTexel(row,1).g; }\n";       // cents from song root
+    p += "float arbitNoteLength(int row){ return arbitNoteAge(row)+arbitNoteRemain(row); }\n";
+    p += "float arbitNoteStartOffset(int row){ return -arbitNoteAge(row); }\n";
+    p += "float arbitNoteEndOffset(int row){ return arbitNoteRemain(row); }\n";
+    p += "float arbitNoteFreq(int row){ return arbitNoteTexel(row,1).r; }\n";        // frame-resolved Hz, including pitch bend
+    p += "float arbitNoteCents(int row){ return arbitNoteTexel(row,1).g; }\n";       // frame-resolved cents from song root
     p += "float arbitNoteTrack(int row){ return arbitNoteTexel(row,1).b; }\n";       // track id
     p += "float arbitNoteIsRoot(int row){ return arbitNoteTexel(row,1).a; }\n";      // 1 = harmonic root
     p += "vec4  arbitNotePrimesLo(int row){ return arbitNoteTexel(row,2); }\n";      // exponents of 2,3,5,7
-    p += "vec4  arbitNotePrimesHi(int row){ return arbitNoteTexel(row,3); }\n";      // 11,13,masterRow,reserved
+    p += "vec4  arbitNotePrimesHi(int row){ return arbitNoteTexel(row,3); }\n";      // 11,13,masterRow,bendSemitones
     p += "float arbitNoteMasterRow(int row){ return arbitNoteTexel(row,3).b; }\n";   // link master's row (-1 = none)
+    p += "float arbitNoteBend(int row){ return arbitNoteTexel(row,3).a; }\n";        // frame-resolved pitch bend in semitones
+    p += "float arbitNotePitch(int row){ return 69.0+12.0*log2(max(arbitNoteFreq(row),0.001)/440.0); }\n";
     p += "float arbitNoteActive(int row){ return (arbitNoteVel(row)>0.0 && arbitNoteAge(row)>=0.0 && arbitNoteRemain(row)>0.0) ? 1.0 : 0.0; }\n";
     p += "vec4  arbitLinkTexel(int edge){ return texelFetch(uLinks, ivec2(edge,0), 0); }\n";   // (slaveRow, masterRow, num, den)
     p += "float arbitLinkRatio(int edge){ vec4 l=arbitLinkTexel(edge); return l.w!=0.0 ? l.z/l.w : 1.0; }\n";
     // Struct view (M5 house shaders — Harmonic Strings / lattice_orbit / etc.):
     // wrap the packed texels so a shader reads note.t0.x directly. Field map
     // matches the flat accessors above — t0=(midi,vel,age,remain),
-    // t1=(freqHz,cents,track,isRoot), t2=primesLo(2,3,5,7),
-    // t3=primesHi(11,13,masterRow,_); link.t0=(slaveRow,masterRow,num,den).
+    // t1=(bentFreqHz,bentCents,track,isRoot), t2=primesLo(2,3,5,7),
+    // t3=primesHi(11,13,masterRow,bendSemitones); link.t0=(slaveRow,masterRow,num,den).
     p += "struct ArbitNote { vec4 t0; vec4 t1; vec4 t2; vec4 t3; };\n";
     p += "struct ArbitLink { vec4 t0; };\n";
     p += "ArbitNote arbitNote(int row){ int r=clamp(row,0,127); ArbitNote n;"
@@ -632,16 +685,15 @@ inline std::string arbitPrelude (Dialect dialect, const IsfHeader* isf)
     // Block D camera helper (P5): primary ray for a fragCoord, aspect-correct
     // (divide by uResolution.y), look-at basis from uCamPos -> uCamTarget with
     // uCamUp, perspective from uCamFov. ro = eye, rd = normalised direction.
-    // uv.y is negated so world-up maps to the DISPLAYED top: Arbit presents the
-    // render-target Y-flipped vs Shadertoy's y-up fragCoord, so the camera helper
-    // compensates (a Shadertoy scene would otherwise render upside-down).
+    // arbitDisplayFragCoord already maps the compositor's storage orientation to
+    // the usual bottom-left shader coordinates, so positive uv.y is world-up.
     p += "void arbitCameraRay(vec2 fragCoord, out vec3 ro, out vec3 rd){"
          " vec2 uv=(fragCoord-0.5*uResolution)/uResolution.y;"
          " vec3 f=normalize(uCamTarget-uCamPos);"
          " vec3 r=normalize(cross(f,uCamUp));"
          " vec3 u=cross(r,f);"
          " float z=1.0/tan(radians(uCamFov)*0.5);"
-         " ro=uCamPos; rd=normalize(uv.x*r-uv.y*u+z*f); }\n";
+         " ro=uCamPos; rd=normalize(uv.x*r+uv.y*u+z*f); }\n";
 
     if (dialect == Dialect::Shadertoy)
     {
@@ -660,9 +712,12 @@ inline std::string arbitPrelude (Dialect dialect, const IsfHeader* isf)
         p += "#define TIMEDELTA uTimeDelta\n";
         p += "#define FRAMEINDEX uFrame\n";
         p += "#define RENDERSIZE uResolution\n";
+        p += "// Deterministic ISF date: fixed project epoch with timeline seconds in .w.\n";
+        p += "#define DATE vec4(1970.0, 1.0, 1.0, uTime)\n";
         p += "#define isf_FragNormCoord (gl_FragCoord.xy / uResolution)\n";
-        p += "#define IMG_PIXEL(img, q) texture(img, (q) / uResolution)\n";
-        p += "#define IMG_NORM_PIXEL(img, q) texture(img, q)\n";
+        p += "#define IMG_PIXEL(img, q) texture(img, arbitTextureCoord(q))\n";
+        p += "#define IMG_NORM_PIXEL(img, q) texture(img, vec2((q).x, 1.0-(q).y))\n";
+        p += "#define IMG_THIS_PIXEL(img) texture(img, arbitTextureCoord(gl_FragCoord.xy))\n";
         p += "#define IMG_SIZE(img) uResolution\n";
         if (isf != nullptr)
         {
@@ -692,6 +747,11 @@ inline std::string arbitPrelude (Dialect dialect, const IsfHeader* isf)
             }
         }
     }
+    // Apply the display-space coordinate contract to bare GLSL, ISF, and
+    // Shadertoy shaders, including sources that provide their own main(). The
+    // helper above was parsed before this macro and therefore still sees the
+    // backend's native fragment coordinate.
+    p += "#define gl_FragCoord arbitDisplayFragCoord()\n";
     p += "// --- user shader ---\n";
     return p;
 }
@@ -783,7 +843,10 @@ inline WrapResult wrapToContract (const std::string& src)
         body = body.substr (isf.bodyStart);
     body = detail::stripVersionLines (body);
 
-    std::string out = arbitPrelude (r.dialect, r.dialect == Dialect::Isf ? &isf : nullptr);
+    const bool includeHsv2Rgb = ! detail::hasFunctionDefinitionCode (
+        body, "vec3", "hsv2rgb", "vec3");
+    std::string out = arbitPrelude (
+        r.dialect, r.dialect == Dialect::Isf ? &isf : nullptr, includeHsv2Rgb);
     out += body;
     if (!out.empty() && out.back() != '\n') out += '\n';
 

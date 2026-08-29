@@ -638,7 +638,7 @@ void main() {
     bool spanX = TexCoord.x >= uCanvasRect.x - bw * uTexel.x && TexCoord.x <= uCanvasRect.z + bw * uTexel.x;
     bool spanY = TexCoord.y >= uCanvasRect.y - bw * uTexel.y && TexCoord.y <= uCanvasRect.w + bw * uTexel.y;
     if ((dx <= bw && spanY) || (dy <= bw && spanX))
-        c = vec4(0.61, 0.42, 0.87, 1.0); // Arbit violet accent
+        c = vec4(0.365, 0.663, 1.0, 1.0); // canvas blue; layer selection stays violet
     FragColor = c;
 }
 )GLSL";
@@ -1594,6 +1594,12 @@ void FrameRenderer::shutdown()
         if (kv.second != nullptr)
             kv.second->shutdown (gl_);
     particleGens_.clear();
+    for (auto& [clipId, texture] : scoreTextures_)
+    {
+        (void) clipId;
+        if (texture != 0) deleteTexture(texture);
+    }
+    scoreTextures_.clear();
     // Free any decoded image-INPUT textures not already released by clearClipShader.
     for (auto& [clipId, byName] : clipImageTex_)
         for (auto& [name, tex] : byName)
@@ -2210,6 +2216,34 @@ unsigned FrameRenderer::renderComposite (const LayerDesc* layers, int numLayers,
 {
     particleBackend_ = "none";
     ++frameParity_;   // one step per composited frame (feedback double-buffer swap)
+    // Native score sources begin as deterministic CPU RGBA, then become ordinary
+    // backend-owned textures before either compositor sees the layer. This keeps
+    // Metal and OpenGL on the same source pixels and lets the existing effects,
+    // transform, mask, blend, inspection and export paths remain authoritative.
+    std::vector<LayerDesc> preparedLayers;
+    bool haveScoreSource = false;
+    for (int i = 0; i < numLayers; ++i)
+        if (layers[i].scoreSource) { haveScoreSource = true; break; }
+    if (haveScoreSource)
+    {
+        preparedLayers.assign(layers, layers + numLayers);
+        for (auto& layer : preparedLayers)
+        {
+            if (!layer.scoreSource || layer.score == nullptr) continue;
+            const ScoreClock scoreClock { static_cast<float>(layer.shaderClock.beat),
+                                          static_cast<float>(layer.shaderClock.beatsPerBar) };
+            const auto rendered = renderScore(*layer.score, scoreClock, outW_, outH_, layer.genParams);
+            auto& texture = scoreTextures_[layer.clipId];
+            texture = rendered.rgba.empty() ? 0
+                : uploadRgba(rendered.rgba.data(), rendered.width, rendered.height,
+                             rendered.width * 4, texture);
+            layer.texture = texture;
+            layer.texWidth = rendered.width;
+            layer.texHeight = rendered.height;
+            layer.scoreSource = false;
+        }
+        layers = preparedLayers.data();
+    }
 #if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
     if (metalRenderer_ != nullptr)
         if (const unsigned nativeTexture = metalRenderer_->renderComposite (

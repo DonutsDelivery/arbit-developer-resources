@@ -48,6 +48,7 @@
 #include "node_preview_presentation.h"
 #include "shader_generator.h"   // ShaderGenerator, ShaderClock, GenParam
 #include "particle_engine.h"    // ParticleEngine, ParticleParams (P4)
+#include "score_renderer.h"
 #include "visual_plan_telemetry.h"
 #if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
 #include "gpu_backend/frame_renderer_metal.h"
@@ -99,6 +100,8 @@ struct LayerDesc
     // notesPresent) seed/colour/force the pool. Composited identically to a
     // shader layer (effects rack, transform, blend all apply).
     bool particleSource = false;
+    bool scoreSource = false;
+    const arbitmod::Score* score = nullptr;
     bool particleStateReset = false;
     bool particleTriggerConnected = false;
     int particleTriggerCount = 0;
@@ -562,6 +565,7 @@ private:
                                            const ParticleParams& params,
                                            const NoteFeatures* notes);
     std::map<int, std::unique_ptr<ParticleEngine>> particleGens_;
+    std::map<int, unsigned> scoreTextures_;
     std::string particleBackend_ = "none";
     std::string compositorBackend_ = "opengl";
 

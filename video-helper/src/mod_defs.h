@@ -75,8 +75,29 @@ struct Clock
     float beatsPerBar = 4.0f;
 };
 
+struct PitchBendPoint
+{
+    float position = 0.0f;
+    float semitones = 0.0f;
+    float tension = 0.0f;
+    float sCurve = 0.0f;
+    float vibratoDepthCents = 0.0f;
+    float vibratoRateHz = 0.0f;
+    int vibratoWaveform = 0;
+    float vibratoFadeIn = 0.0f;
+    float vibratoFadeOut = 0.0f;
+};
+
+struct PitchAnchor
+{
+    int id = -1;
+    float position = 0.0f;
+    float frequency = 0.0f;
+};
+
 struct Note
 {
+    struct NotationComma { int prime = 0; int exponent = 0; };
     int   id          = 0;
     int   trackId     = 0;
     float startBeat   = 0.0f;
@@ -84,16 +105,150 @@ struct Note
     float midiNote    = 60.0f;
     float velocity    = 100.0f;     // 0..127
     float freqHz      = 261.625565f;
+    float durationSeconds = 0.0f;
+    std::vector<PitchBendPoint> pitchBendPoints;
+    std::vector<PitchAnchor> pitchAnchors;
     int   ratioNum    = 1;          // reduced interval vs root
     int   ratioDen    = 1;
     float primes[6]   = {0,0,0,0,0,0};  // exponents of 2,3,5,7,11,13
     int   linkMasterId = -1;        // master note id, or -1
     bool  isRoot      = false;
+    float centsOffset = 0.0f;
+    int edoStep = -1;
+    bool muted = false;
+    bool notationVisible = true;
+    int diatonicIndex = 28;
+    int baseAccidental = 0;
+    bool linked = false;
+    std::array<NotationComma, 9> commas {};
+    int commaCount = 0;
+    bool hasUnmappedPrime = false;
+    bool edoActive = false;
+    int edoInflection = 0;
+    int edoDegree = 0;
 
     float endBeat()  const { return startBeat + lengthBeats; }
     bool  activeAt (float b) const { return b >= startBeat && b < endBeat(); }
     bool  startedBy (float b) const { return startBeat <= b; }
 };
+
+inline float shapePitchBendProgress (float progress, float tension, float sCurve)
+{
+    float t = std::clamp (progress, 0.0f, 1.0f);
+    if (sCurve > 0.001f)
+    {
+        const float k = 1.0f + sCurve * 6.0f;
+        t = t <= 0.5f
+            ? 0.5f * std::pow (2.0f * t, k)
+            : 1.0f - 0.5f * std::pow (2.0f * (1.0f - t), k);
+    }
+    if (std::fabs (tension) > 0.001f)
+    {
+        if (tension > 0.0f)
+            t = t * (1.0f - tension) + std::pow (t, 3.0f) * tension;
+        else
+            t = t * (1.0f + tension)
+              + (1.0f - std::pow (1.0f - t, 3.0f)) * (-tension);
+    }
+    return t;
+}
+
+inline float pitchBendWave (int waveform, float phase)
+{
+    if (waveform == 1)
+    {
+        float cycle = std::fmod (phase / (2.0f * 3.14159265f), 1.0f);
+        if (cycle < 0.0f) cycle += 1.0f;
+        return 4.0f * std::fabs (cycle - 0.5f) - 1.0f;
+    }
+    return std::sin (phase);
+}
+
+inline float pitchBendEnvelope (float progress, float fadeIn, float fadeOut)
+{
+    float envelope = 1.0f;
+    if (fadeIn > 0.001f && progress < fadeIn)
+        envelope = progress / fadeIn;
+    if (fadeOut > 0.001f && progress > 1.0f - fadeOut)
+        envelope = std::min (envelope, (1.0f - progress) / fadeOut);
+    return std::clamp (envelope, 0.0f, 1.0f);
+}
+
+inline float interpolatePitchBend (const std::vector<PitchBendPoint>& points,
+                                   float position, float noteLengthSeconds = 0.0f)
+{
+    if (points.empty()) return 0.0f;
+    position = std::clamp (position, 0.0f, 1.0f);
+    float previousPosition = 0.0f;
+    float previousSemitones = points.front().semitones;
+    for (const auto& point : points)
+    {
+        if (position <= point.position)
+        {
+            float progress = point.position - previousPosition > 0.0001f
+                ? (position - previousPosition) / (point.position - previousPosition)
+                : 0.0f;
+            progress = shapePitchBendProgress (progress, point.tension, point.sCurve);
+            float semitones = previousSemitones
+                + progress * (point.semitones - previousSemitones);
+            if (point.vibratoDepthCents > 0.01f && point.vibratoRateHz > 0.01f
+                && noteLengthSeconds > 0.0f)
+            {
+                const float segmentSeconds = (point.position - previousPosition)
+                                           * noteLengthSeconds;
+                const float phase = 2.0f * 3.14159265f * point.vibratoRateHz
+                                  * progress * segmentSeconds;
+                semitones += pitchBendWave (point.vibratoWaveform, phase)
+                           * (point.vibratoDepthCents / 100.0f)
+                           * pitchBendEnvelope (progress, point.vibratoFadeIn,
+                                                point.vibratoFadeOut);
+            }
+            return semitones;
+        }
+        previousPosition = point.position;
+        previousSemitones = point.semitones;
+    }
+    return points.back().semitones;
+}
+
+inline float pitchFrequencyAtBeat (const Note& note, float beat)
+{
+    const float position = note.lengthBeats > 0.0001f
+        ? std::clamp ((beat - note.startBeat) / note.lengthBeats, 0.0f, 1.0f)
+        : 0.0f;
+    const float bend = interpolatePitchBend (
+        note.pitchBendPoints, position, note.durationSeconds);
+    const PitchAnchor* activeAnchor = nullptr;
+    for (const auto& anchor : note.pitchAnchors)
+        if (anchor.position <= position + 0.0001f
+            && (activeAnchor == nullptr
+                || anchor.position > activeAnchor->position
+                || (anchor.position == activeAnchor->position && anchor.id > activeAnchor->id)))
+            activeAnchor = &anchor;
+    if (activeAnchor == nullptr || activeAnchor->frequency <= 0.0f
+        || ! std::isfinite (activeAnchor->frequency))
+        return note.freqHz * std::pow (2.0f, bend / 12.0f);
+    const float anchorBend = interpolatePitchBend (
+        note.pitchBendPoints, activeAnchor->position, note.durationSeconds);
+    return activeAnchor->frequency * std::pow (2.0f, (bend - anchorBend) / 12.0f);
+}
+
+constexpr float kDefaultScoreHistoryBeats = 8.0f;
+constexpr float kDefaultScoreLookaheadBeats = 16.0f;
+
+// 3 = sounding, 2 = upcoming, 1 = recently ended, 0 = outside the
+// score-visible timeline window. Block C and programmable hooks share this
+// predicate so shaders and scripts see the same past/future span.
+inline int timelineResidency (const Note& note, float beat,
+                              float historyBeats, float lookaheadBeats)
+{
+    if (note.activeAt (beat)) return 3;
+    if (note.startBeat > beat && note.startBeat <= beat + std::max (0.0f, lookaheadBeats))
+        return 2;
+    if (note.endBeat() <= beat && note.endBeat() >= beat - std::max (0.0f, historyBeats))
+        return 1;
+    return 0;
+}
 
 struct Link
 {
@@ -107,7 +262,12 @@ struct Link
 
 struct Score
 {
+    int notationVersion = 1;
+    uint64_t scoreRevision = 0;
+    int edoStepsPerOctave = 12;
     float rootFreq = 261.625565f;
+    float historyBeats = kDefaultScoreHistoryBeats;
+    float lookaheadBeats = kDefaultScoreLookaheadBeats;
     std::vector<Note> notes;
     std::vector<Link> links;
 

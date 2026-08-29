@@ -14,7 +14,7 @@
 #include "mix_analyze.h"        // shared decode+offline-analyze (live viewport reuses this)
 #include "block_c_packer.h"     // A2 Block C note/link voice allocator (header-only)
 #include "video_param_grammar.h" // Stage 6: shared render-graph param resolver (single source of truth)
-#include <GLFW/glfw3.h>
+#include "helper_glfw.h"
 #if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOSurface/IOSurface.h>
@@ -762,7 +762,7 @@ struct GlExportContext
         }
         return true;
 #else
-        if (glfwInit() != GLFW_TRUE)
+        if (! initializeHelperGlfw())
         {
             errorOut = "glfwInit failed (no display?)";
             return false;
@@ -1399,10 +1399,15 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
     // generator type; the segment is the discriminator). Dispatched to a
     // dedicated no-decode layer-build branch, like shader/adjustment clips.
     std::set<int> particleClips;
+    std::set<int> scoreClips;
     for (const auto& s : job.segments)
-        if (videowire::resolveSourceKind (s.sourceKind, s.isAdjustment, s.sourcePath)
-            == videowire::SourceKind::Particles)
+    {
+        const auto kind = videowire::resolveSourceKind(s.sourceKind, s.isAdjustment, s.sourcePath);
+        if (kind == videowire::SourceKind::Particles)
             particleClips.insert (s.clipId);
+        else if (kind == videowire::SourceKind::Score)
+            scoreClips.insert(s.clipId);
+    }
 
     // Block B audio features (M4): if any shader clip is present and a master
     // mix WAV was provided, analyze it ONCE up front (A3 block_b_analyzer) so the
@@ -1447,20 +1452,21 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
     // rows as if all active notes entered at once). Catch-up is CPU-only (pack, no
     // GL), so spanning the whole pre-range is cheap. Empty score ⇒ shaders see the
     // zero-feed (uNoteCount 0, samplers black). See exporter.h §score.
-    const bool haveScore = (! shaderClips.empty() || ! particleClips.empty())
+    const bool haveScore = (! shaderClips.empty() || ! particleClips.empty() || ! scoreClips.empty())
                          && ! job.score.notes.empty();
     arbitblockc::BlockCPacker scorePacker;   // ctor reset() → deterministic from beat 0
     auto packNotesAtBeat = [&] (double beat) -> videorender::NoteFeatures
     {
         videorender::NoteFeatures nf;
         if (! haveScore) return nf;
-        const arbitblockc::PackResult pr =
-            scorePacker.pack (job.score, (float) beat, (float) job.scoreLookaheadBeats);
+        const arbitblockc::PackResult pr = scorePacker.pack (job.score, (float) beat);
         nf.notesTex  = pr.notesTex;
         nf.linksTex  = pr.linksTex;
         nf.noteCount = pr.noteCount;
         nf.linkCount = pr.linkCount;
         nf.rootFreq  = job.score.rootFreq;
+        nf.historyBeats = job.score.historyBeats;
+        nf.lookaheadBeats = job.score.lookaheadBeats;
         return nf;
     };
     // Memoized, monotonic per-frame driver. g = the timeline frame index (t·fps,
@@ -1588,7 +1594,8 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
     std::map<std::string, double> luaOverrides;
     long luaFrameDone = -1;
     bool luaErrLogged = false;
-    std::vector<arbitlua::HookNote> luaNotes;    // active notes for the frame being built
+    std::vector<arbitlua::HookNote> luaNotes;    // active notes for backward-compatible ctx.notes
+    std::vector<arbitlua::HookNote> luaTimelineNotes; // past/future ctx.timelineNotes
     std::vector<arbitlua::HookLink> luaLinks;    // the link graph (score-global, built once)
     for (const auto& l : job.score.links)
     {
@@ -1613,6 +1620,8 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
             ctx.beatsPerBar = frameClock.beatsPerBar;
             ctx.frame       = f;
             ctx.rootFreq    = luaRootFreq;
+            ctx.scoreHistoryBeats = job.score.historyBeats;
+            ctx.scoreLookaheadBeats = job.score.lookaheadBeats;
             videorender::AudioFeatures vaf;      // zero-fed before the range start
             if (ft >= rangeStartSec)
                 vaf = audioFeatureAt (ft - rangeStartSec);
@@ -1620,23 +1629,38 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
             ctx.onset = vaf.onset; ctx.onsetAge = vaf.onsetAge;
             ctx.bands = vaf.bands.empty() ? nullptr : vaf.bands.data();
             ctx.bandCount = (int) vaf.bands.size();
-            // ctx.notes — the notes SOUNDING at this beat, with JI cents/ratio.
+            // Keep ctx.notes active-only. ctx.timelineNotes is the additive
+            // past/future view used by piano-roll scripts.
             luaNotes.clear();
+            luaTimelineNotes.clear();
             const float beatF = (float) ctx.beat;
             for (const auto& n : job.score.notes)
-                if (n.activeAt (beatF))
+            {
+                const bool active = n.activeAt (beatF);
+                const bool inTimeline = arbitmod::timelineResidency (
+                    n, beatF, job.score.historyBeats, job.score.lookaheadBeats) > 0;
+                if (active || inTimeline)
                 {
                     arbitlua::HookNote hn;
+                    hn.id = n.id;
                     hn.midi = n.midiNote; hn.freq = n.freqHz; hn.velocity = n.velocity;
                     hn.cents = arbitmod::centsFromRoot (n.freqHz, job.score.rootFreq);
                     hn.age = ctx.beat - n.startBeat;
+                    hn.remain = n.endBeat() - ctx.beat;
+                    hn.startBeat = n.startBeat;
+                    hn.lengthBeats = n.lengthBeats;
+                    hn.active = active;
                     hn.trackId = n.trackId; hn.ratioNum = n.ratioNum; hn.ratioDen = n.ratioDen;
                     hn.isRoot = n.isRoot;
                     for (int p = 0; p < 6; ++p) hn.primes[p] = n.primes[p];
-                    luaNotes.push_back (hn);
+                    if (active) luaNotes.push_back (hn);
+                    if (inTimeline) luaTimelineNotes.push_back (hn);
                 }
+            }
             ctx.notes = luaNotes.empty() ? nullptr : luaNotes.data();
             ctx.noteCount = (int) luaNotes.size();
+            ctx.timelineNotes = luaTimelineNotes.empty() ? nullptr : luaTimelineNotes.data();
+            ctx.timelineNoteCount = (int) luaTimelineNotes.size();
             ctx.links = luaLinks.empty() ? nullptr : luaLinks.data();
             ctx.linkCount = (int) luaLinks.size();
             luaOverrides.clear();                // keep only the latest frame's overrides
@@ -2026,9 +2050,18 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
                                  const videorender::AudioFeatures* audio,
                                  const videorender::NoteFeatures* notes,
                                  bool isAdjustment = false,
-                                 bool particleSource = false)
+                                 bool particleSource = false,
+                                 bool scoreSource = false,
+                                 const arbitmod::Score* score = nullptr)
     {
-        if (particleSource)
+        if (scoreSource)
+        {
+            d.scoreSource = true;
+            d.score = score;
+            if (shaderClock != nullptr) d.shaderClock = *shaderClock;
+            d.genParams = p.genParams;
+        }
+        else if (particleSource)
         {
             // P4 particle clip: texture stays 0 — the renderer's ParticleEngine
             // fills it. The Block A clock drives the sim, the packed score seeds
@@ -2314,10 +2347,13 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
                 // function of display time + tempo (== the viewport's formula).
                 const double segDur = (al.seg->outSec - al.seg->inSec)
                                     / std::max (al.seg->rate, 1e-9);
-                const int frameIdx = (int) std::llround (
-                    (t - al.seg->displayStartSec) * job.fps);
+                const double clockStart = al.seg->clockStartSec >= 0.0
+                    ? al.seg->clockStartSec : al.seg->displayStartSec;
+                const double clockDuration = al.seg->clockDurationSec > 0.0
+                    ? al.seg->clockDurationSec : segDur;
+                const int frameIdx = (int) std::llround ((t - clockStart) * job.fps);
                 const videorender::ShaderClock clock = videorender::makeShaderClock (
-                    t, al.seg->displayStartSec, segDur, job.beatTimeline,
+                    t, clockStart, clockDuration, job.beatTimeline,
                     job.fps, true, frameIdx);
                 // Block B (M4): the mix WAV is range-scoped (sample 0 ==
                 // rangeStartSec), so sample its features at buffer-relative time.
@@ -2333,14 +2369,32 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
                 // (frameNotes) seeds from the spawn track ⇒ export == preview.
                 const double segDur = (al.seg->outSec - al.seg->inSec)
                                     / std::max (al.seg->rate, 1e-9);
-                const int frameIdx = (int) std::llround (
-                    (t - al.seg->displayStartSec) * job.fps);
+                const double clockStart = al.seg->clockStartSec >= 0.0
+                    ? al.seg->clockStartSec : al.seg->displayStartSec;
+                const double clockDuration = al.seg->clockDurationSec > 0.0
+                    ? al.seg->clockDurationSec : segDur;
+                const int frameIdx = (int) std::llround ((t - clockStart) * job.fps);
                 const videorender::ShaderClock clock = videorender::makeShaderClock (
-                    t, al.seg->displayStartSec, segDur, job.beatTimeline,
+                    t, clockStart, clockDuration, job.beatTimeline,
                     job.fps, true, frameIdx);
                 fillDesc (d, al.params, nullptr, t, al.seg->clipId, &clock,
                           nullptr, frameNotes, /*isAdjustment=*/false,
                           /*particleSource=*/true);
+            }
+            else if (sourceKind == videowire::SourceKind::Score)
+            {
+                const double segDur = (al.seg->outSec - al.seg->inSec)
+                                    / std::max(al.seg->rate, 1e-9);
+                const double clockStart = al.seg->clockStartSec >= 0.0
+                    ? al.seg->clockStartSec : al.seg->displayStartSec;
+                const double clockDuration = al.seg->clockDurationSec > 0.0
+                    ? al.seg->clockDurationSec : segDur;
+                const int frameIdx = static_cast<int>(std::llround((t - clockStart) * job.fps));
+                const auto clock = videorender::makeShaderClock(
+                    t, clockStart, clockDuration, job.beatTimeline,
+                    job.fps, true, frameIdx);
+                fillDesc(d, al.params, nullptr, t, al.seg->clipId, &clock,
+                         nullptr, nullptr, false, false, true, &job.score);
             }
             else if (sourceKind == videowire::SourceKind::Adjustment)
             {

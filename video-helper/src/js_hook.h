@@ -13,7 +13,8 @@
 //   }
 //
 // ctx mirrors the Lua ctx field-for-field, but with JS conventions: ctx.bands,
-// ctx.notes, ctx.links are 0-indexed arrays (Lua's were 1-indexed). The note JI
+// ctx.notes, ctx.timelineNotes, and ctx.links are 0-indexed arrays. Lua uses
+// 1-indexed arrays. The note JI
 // data (cents, ratio, prime exponents) is the same Arbit-unique payload.
 //
 // Reuses lua_hook.h's FrameCtx / HookNote / HookLink PODs verbatim (the plan's
@@ -181,8 +182,11 @@ inline bool JsHook::runFrame (const FrameCtx& ctx,
     setNum (cobj, "onset", ctx.onset);
     setNum (cobj, "onsetAge", ctx.onsetAge);
     setNum (cobj, "noteCount", (double) ctx.noteCount);
+    setNum (cobj, "timelineNoteCount", (double) ctx.timelineNoteCount);
     setNum (cobj, "linkCount", (double) ctx.linkCount);
     setNum (cobj, "rootFreq", ctx.rootFreq);
+    setNum (cobj, "scoreHistoryBeats", ctx.scoreHistoryBeats);
+    setNum (cobj, "scoreLookaheadBeats", ctx.scoreLookaheadBeats);
 
     // ctx.bands[0..N-1] (0-indexed — JS convention).
     JSValue bands = JS_NewArray (c);
@@ -191,28 +195,38 @@ inline bool JsHook::runFrame (const FrameCtx& ctx,
                               JS_NewFloat64 (c, ctx.bands != nullptr ? ctx.bands[i] : 0.0));
     JS_SetPropertyStr (c, cobj, "bands", bands);
 
-    // ctx.notes[0..noteCount-1] — sounding notes with their JI data.
-    JSValue notes = JS_NewArray (c);
-    for (int i = 0; i < ctx.noteCount; ++i)
+    auto buildNotes = [&] (const HookNote* values, int count)
     {
-        const HookNote& n = ctx.notes[i];
-        JSValue o = JS_NewObject (c);
-        setNum (o, "midi", n.midi);
-        setNum (o, "freq", n.freq);
-        setNum (o, "velocity", n.velocity);
-        setNum (o, "cents", n.cents);
-        setNum (o, "age", n.age);
-        JS_SetPropertyStr (c, o, "trackId", JS_NewInt32 (c, n.trackId));
-        JS_SetPropertyStr (c, o, "ratioNum", JS_NewInt32 (c, n.ratioNum));
-        JS_SetPropertyStr (c, o, "ratioDen", JS_NewInt32 (c, n.ratioDen));
-        JS_SetPropertyStr (c, o, "isRoot", JS_NewBool (c, n.isRoot));
-        JSValue primes = JS_NewArray (c);          // note.primes[0..5] = exps of 2,3,5,7,11,13
-        for (int p = 0; p < 6; ++p)
-            JS_SetPropertyUint32 (c, primes, (uint32_t) p, JS_NewFloat64 (c, n.primes[p]));
-        JS_SetPropertyStr (c, o, "primes", primes);
-        JS_SetPropertyUint32 (c, notes, (uint32_t) i, o);
-    }
-    JS_SetPropertyStr (c, cobj, "notes", notes);
+        JSValue notes = JS_NewArray (c);
+        for (int i = 0; i < count; ++i)
+        {
+            const HookNote& n = values[i];
+            JSValue o = JS_NewObject (c);
+            JS_SetPropertyStr (c, o, "id", JS_NewInt32 (c, n.id));
+            setNum (o, "midi", n.midi);
+            setNum (o, "freq", n.freq);
+            setNum (o, "velocity", n.velocity);
+            setNum (o, "cents", n.cents);
+            setNum (o, "age", n.age);
+            setNum (o, "remain", n.remain);
+            setNum (o, "startBeat", n.startBeat);
+            setNum (o, "lengthBeats", n.lengthBeats);
+            JS_SetPropertyStr (c, o, "active", JS_NewBool (c, n.active));
+            JS_SetPropertyStr (c, o, "trackId", JS_NewInt32 (c, n.trackId));
+            JS_SetPropertyStr (c, o, "ratioNum", JS_NewInt32 (c, n.ratioNum));
+            JS_SetPropertyStr (c, o, "ratioDen", JS_NewInt32 (c, n.ratioDen));
+            JS_SetPropertyStr (c, o, "isRoot", JS_NewBool (c, n.isRoot));
+            JSValue primes = JS_NewArray (c);
+            for (int p = 0; p < 6; ++p)
+                JS_SetPropertyUint32 (c, primes, (uint32_t) p, JS_NewFloat64 (c, n.primes[p]));
+            JS_SetPropertyStr (c, o, "primes", primes);
+            JS_SetPropertyUint32 (c, notes, (uint32_t) i, o);
+        }
+        return notes;
+    };
+    JS_SetPropertyStr (c, cobj, "notes", buildNotes (ctx.notes, ctx.noteCount));
+    JS_SetPropertyStr (c, cobj, "timelineNotes",
+                       buildNotes (ctx.timelineNotes, ctx.timelineNoteCount));
 
     // ctx.links[0..linkCount-1] — the harmonic link graph (score-global).
     JSValue links = JS_NewArray (c);

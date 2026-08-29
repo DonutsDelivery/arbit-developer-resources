@@ -12,6 +12,7 @@
 #include "tracking_runtime.h"
 #include "visual_plan_publication.h"
 #include "viewport_telemetry_owner.h"
+#include "helper_glfw.h"
 #include "VideoFrameSharedMemory.h"
 #if ARBIT_HAVE_ONNX || ARBIT_HAVE_NCNN
 #include "interp.h" // retime tier 2 (async RIFE "Speed Warp") worker
@@ -247,7 +248,6 @@ struct Viewport::Impl
     // actually changes (not every frame). Empty score ⇒ shaders see the
     // zero-feed (uNoteCount 0), identical to never calling setScore.
     arbitmod::Score score;
-    double scoreLookaheadBeats = 0.0;
     uint64_t scoreGeneration = 0;
 
     // M6 cross-domain mod matrix (setModMatrix). Routings are evaluated each
@@ -626,7 +626,7 @@ std::string Viewport::open (int width, int height, int x, int y,
     // Cocoa requires NSWindow creation and destruction on the process main
     // thread. The render worker may own Metal encoding, but it must reuse the
     // GLFW window created here while the RPC handler is still on main.
-    if (glfwInit() != GLFW_TRUE)
+    if (! initializeHelperGlfw())
     {
         impl_.reset();
         return "glfwInit failed on macOS main thread";
@@ -680,7 +680,7 @@ std::string Viewport::openShared (int width, int height, double targetFps,
     impl_->sharedMode = true;
     impl_->sharedBufferCount = std::clamp (bufferCount, 2, 4);
 #if defined (__APPLE__)
-    if (glfwInit() != GLFW_TRUE)
+    if (! initializeHelperGlfw())
     {
         impl_.reset();
         return "glfwInit failed on macOS main thread";
@@ -763,7 +763,7 @@ std::string Viewport::openShm (int width, int height, double targetFps,
     }
 
 #if defined (__APPLE__)
-    if (glfwInit() != GLFW_TRUE)
+    if (! initializeHelperGlfw())
     {
         impl_.reset();
         return "glfwInit failed on macOS main thread";
@@ -1055,12 +1055,11 @@ void Viewport::acceptRuntimeRevision (uint64_t revision) noexcept
                seen, revision, std::memory_order_release, std::memory_order_relaxed)) {}
 }
 
-void Viewport::setScore (arbitmod::Score score, double lookaheadBeats)
+void Viewport::setScore (arbitmod::Score score)
 {
     if (impl_ == nullptr) return;
     std::lock_guard<std::mutex> lock (impl_->mutex);
     impl_->score = std::move (score);
-    impl_->scoreLookaheadBeats = lookaheadBeats;
     ++impl_->scoreGeneration;
 }
 
@@ -1175,6 +1174,16 @@ std::string Viewport::setCanvasBackground (double r, double g, double b, double 
     return {};
 }
 
+std::string Viewport::setView (double zoom, double panX, double panY)
+{
+    if (! std::isfinite (zoom) || ! std::isfinite (panX) || ! std::isfinite (panY))
+        return "bad view transform";
+    viewZoom_ = std::clamp (zoom, 0.02, 32.0);
+    viewPanX_ = panX;
+    viewPanY_ = panY;
+    return {};
+}
+
 std::string Viewport::setPostFx (double bloomIntensity, double bloomThreshold,
                                  double bloomRadius, int tonemap, double exposure)
 {
@@ -1194,7 +1203,7 @@ std::string Viewport::setParam (const std::string& paramId, double value, double
     if (paramId.rfind ("view/", 0) == 0)
     {
         const std::string p = paramId.substr (5);
-        if (p == "zoom") { viewZoom_ = std::clamp (value, 0.02, 32.0); return {}; }
+        if (p == "zoom") return setView (value, viewPanX_.load(), viewPanY_.load());
         if (p == "panX") { viewPanX_ = value; return {}; }
         if (p == "panY") { viewPanY_ = value; return {}; }
         return "unknown view param: " + paramId;
@@ -1689,7 +1698,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
 #endif
     if (win == nullptr)
     {
-        if (glfwInit() != GLFW_TRUE)
+        if (! initializeHelperGlfw())
         {
             im.openError = "glfwInit failed (no display?)";
             im.openDone = true;
@@ -2409,7 +2418,6 @@ void Viewport::renderLoop (int width, int height, int x, int y,
     // mirror the control-plane copy so we only re-copy + reset on a real change.
     arbitblockc::BlockCPacker scorePacker;
     arbitmod::Score localScore;
-    double localScoreLookahead = 0.0;
     uint64_t scoreGenSeen = ~0ull;
     long scorePackedFrame = -1;
     videorender::NoteFeatures cachedNoteFeatures;
@@ -2447,7 +2455,8 @@ void Viewport::renderLoop (int width, int height, int x, int y,
     bool scriptErrLogged = false;       // throttle frame() error spam to once
     long scriptRanFrame = -1;           // last timeline frame frame() was run for
     std::map<std::string, double> scriptOverrides;     // this frame's overrides
-    std::vector<arbitlua::HookNote> scriptNotes;       // scratch (rebuilt per run)
+    std::vector<arbitlua::HookNote> scriptNotes;       // active-only compatibility view
+    std::vector<arbitlua::HookNote> scriptTimelineNotes; // past/future piano-roll view
     std::vector<arbitlua::HookLink> scriptLinks;       // scratch (rebuilt per run)
 
     // M4 Block B live audio (render-thread owned). The analyzer is stepped each
@@ -2863,7 +2872,6 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             if (im.scoreGeneration != scoreGenSeen)
             {
                 localScore = im.score;
-                localScoreLookahead = im.scoreLookaheadBeats;
                 scoreGenSeen = im.scoreGeneration;
                 scorePacker.reset();
                 scorePackedFrame = -1;
@@ -3028,8 +3036,8 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             // on the rounded timeline frame so a paused/repeated frame is stable
             // and the script's ctx.frame does not race the render rate. The ctx is
             // built field-for-field like the exporter's: live clock + the Block B
-            // live mix (liveAud, zero-fed when no audio) + the notes SOUNDING at
-            // this beat from the live Block C score, with their JI cents/ratio.
+            // live mix (liveAud, zero-fed when no audio) + the same past/future
+            // note window the live Block C shader feed receives.
             if (scriptActive)
             {
                 const double clkFps = valueFps;  // project value-grid fps (== export job.fps)
@@ -3044,6 +3052,8 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                     ctx.beatsPerBar = beatsPerBar;
                     ctx.frame       = g;
                     ctx.rootFreq    = localScore.rootFreq;
+                    ctx.scoreHistoryBeats = localScore.historyBeats;
+                    ctx.scoreLookaheadBeats = localScore.lookaheadBeats;
                     // Block B live audio (zero-fed when no ring / before playback).
                     ctx.rms = liveAud.rms; ctx.peak = liveAud.peak; ctx.onset = liveAud.onset;
                     ctx.onsetAge = haveAudio ? cachedAudioFeatures.onsetAge : 0.0f;
@@ -3051,7 +3061,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                         ? (int) std::min<size_t> (64, cachedAudioFeatures.bands.size()) : 0;
                     ctx.bands = liveBands > 0 ? liveAud.bands : nullptr;
                     ctx.bandCount = liveBands;
-                    // Block C score: links (score-global) + notes sounding at this beat.
+                    // Block C score: full links plus active and timeline views.
                     scriptLinks.clear();
                     for (const auto& l : localScore.links)
                     {
@@ -3063,21 +3073,36 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                         scriptLinks.push_back (hl);
                     }
                     scriptNotes.clear();
+                    scriptTimelineNotes.clear();
                     const float beatF = (float) ctx.beat;
                     for (const auto& n : localScore.notes)
-                        if (n.activeAt (beatF))
+                    {
+                        const bool active = n.activeAt (beatF);
+                        const bool inTimeline = arbitmod::timelineResidency (
+                            n, beatF, localScore.historyBeats, localScore.lookaheadBeats) > 0;
+                        if (active || inTimeline)
                         {
                             arbitlua::HookNote hn;
+                            hn.id = n.id;
                             hn.midi = n.midiNote; hn.freq = n.freqHz; hn.velocity = n.velocity;
                             hn.cents = arbitmod::centsFromRoot (n.freqHz, localScore.rootFreq);
                             hn.age = ctx.beat - n.startBeat;
+                            hn.remain = n.endBeat() - ctx.beat;
+                            hn.startBeat = n.startBeat;
+                            hn.lengthBeats = n.lengthBeats;
+                            hn.active = active;
                             hn.trackId = n.trackId; hn.ratioNum = n.ratioNum; hn.ratioDen = n.ratioDen;
                             hn.isRoot = n.isRoot;
                             for (int p = 0; p < 6; ++p) hn.primes[p] = n.primes[p];
-                            scriptNotes.push_back (hn);
+                            if (active) scriptNotes.push_back (hn);
+                            if (inTimeline) scriptTimelineNotes.push_back (hn);
                         }
+                    }
                     ctx.notes = scriptNotes.empty() ? nullptr : scriptNotes.data();
                     ctx.noteCount = (int) scriptNotes.size();
+                    ctx.timelineNotes = scriptTimelineNotes.empty()
+                        ? nullptr : scriptTimelineNotes.data();
+                    ctx.timelineNoteCount = (int) scriptTimelineNotes.size();
                     ctx.links = scriptLinks.empty() ? nullptr : scriptLinks.data();
                     ctx.linkCount = (int) scriptLinks.size();
                     scriptOverrides.clear();
@@ -3471,17 +3496,20 @@ void Viewport::renderLoop (int width, int height, int x, int y,
         // notes), so the score must be packed when one is on-screen even with no
         // shader clip present.
         bool haveParticleClip = false;
+        bool haveScoreClip = false;
         for (const auto& al : act)
-            if (videowire::resolveSourceKind (al.seg.sourceKind, al.seg.isAdjustment,
-                                              al.seg.sourcePath)
-                == videowire::SourceKind::Particles)
-            { haveParticleClip = true; break; }
+        {
+            const auto kind = videowire::resolveSourceKind(
+                al.seg.sourceKind, al.seg.isAdjustment, al.seg.sourcePath);
+            if (kind == videowire::SourceKind::Particles) haveParticleClip = true;
+            else if (kind == videowire::SourceKind::Score) haveScoreClip = true;
+        }
 
         // M5: pack the live Block C score once per timeline frame (only when a
         // shader or particle clip is on-screen to read it). The packed beat
         // matches makeShaderClock's shared beat timeline; re-packing a held frame is
         // skipped via scorePackedFrame so a paused/repeated frame stays stable.
-        const bool haveScore = (! shaderClips.empty() || haveParticleClip)
+        const bool haveScore = (! shaderClips.empty() || haveParticleClip || haveScoreClip)
                              && ! localScore.notes.empty();
         if (haveScore)
         {
@@ -3490,12 +3518,14 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             if (g != scorePackedFrame)
             {
                 const arbitblockc::PackResult pr = scorePacker.pack (
-                    localScore, (float) displayBeat, (float) localScoreLookahead);
+                    localScore, (float) displayBeat);
                 cachedNoteFeatures.notesTex  = pr.notesTex;
                 cachedNoteFeatures.linksTex  = pr.linksTex;
                 cachedNoteFeatures.noteCount = pr.noteCount;
                 cachedNoteFeatures.linkCount = pr.linkCount;
                 cachedNoteFeatures.rootFreq  = localScore.rootFreq;
+                cachedNoteFeatures.historyBeats = localScore.historyBeats;
+                cachedNoteFeatures.lookaheadBeats = localScore.lookaheadBeats;
                 scorePackedFrame = g;
             }
         }
@@ -3558,6 +3588,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                 al.seg.sourceKind, al.seg.isAdjustment, al.seg.sourcePath);
             const bool isAdjustment = sourceKind == videowire::SourceKind::Adjustment;
             const bool isParticles = sourceKind == videowire::SourceKind::Particles;
+            const bool isScore = sourceKind == videowire::SourceKind::Score;
             const bool isShader = sourceKind == videowire::SourceKind::Shader
                                && shaderClips.count (al.seg.clipId) > 0;
             ClipStream* cs = nullptr;
@@ -3583,11 +3614,14 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                 const double segDur = (al.seg.outSec - al.seg.inSec)
                                     / std::max (al.seg.rate, 1e-9);
                 const double clkFps = valueFps;  // project value-grid fps (== export job.fps)
-                const int frameIdx = (int) std::llround (
-                    (displaySec - al.seg.displayStartSec) * clkFps);
+                const double clockStart = al.seg.clockStartSec >= 0.0
+                    ? al.seg.clockStartSec : al.seg.displayStartSec;
+                const double clockDuration = al.seg.clockDurationSec > 0.0
+                    ? al.seg.clockDurationSec : segDur;
+                const int frameIdx = (int) std::llround ((displaySec - clockStart) * clkFps);
                 d.shaderSource = true;
                 d.shaderClock = videorender::makeShaderClock (
-                    displaySec, al.seg.displayStartSec, segDur, activeBeatTimeline,
+                    displaySec, clockStart, clockDuration, activeBeatTimeline,
                     clkFps, playing, frameIdx);
                 fillDescCommon (d, al.params, displaySec, al.seg.clipId);
                 if (haveScore)
@@ -3610,11 +3644,14 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                 const double segDur = (al.seg.outSec - al.seg.inSec)
                                     / std::max (al.seg.rate, 1e-9);
                 const double clkFps = valueFps;  // project value-grid fps (== export job.fps)
-                const int frameIdx = (int) std::llround (
-                    (displaySec - al.seg.displayStartSec) * clkFps);
+                const double clockStart = al.seg.clockStartSec >= 0.0
+                    ? al.seg.clockStartSec : al.seg.displayStartSec;
+                const double clockDuration = al.seg.clockDurationSec > 0.0
+                    ? al.seg.clockDurationSec : segDur;
+                const int frameIdx = (int) std::llround ((displaySec - clockStart) * clkFps);
                 d.particleSource = true;
                 d.shaderClock = videorender::makeShaderClock (
-                    displaySec, al.seg.displayStartSec, segDur, activeBeatTimeline,
+                    displaySec, clockStart, clockDuration, activeBeatTimeline,
                     clkFps, playing, frameIdx);
                 fillDescCommon (d, al.params, displaySec, al.seg.clipId);
                 if (haveScore)
@@ -3622,6 +3659,23 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                     d.noteFeatures = cachedNoteFeatures;
                     d.notesPresent = true;
                 }
+            }
+            else if (isScore)
+            {
+                const double segDur = (al.seg.outSec - al.seg.inSec)
+                                    / std::max(al.seg.rate, 1e-9);
+                const double clkFps = valueFps;
+                const double clockStart = al.seg.clockStartSec >= 0.0
+                    ? al.seg.clockStartSec : al.seg.displayStartSec;
+                const double clockDuration = al.seg.clockDurationSec > 0.0
+                    ? al.seg.clockDurationSec : segDur;
+                const int frameIdx = static_cast<int>(std::llround((displaySec - clockStart) * clkFps));
+                d.scoreSource = true;
+                d.score = &localScore;
+                d.shaderClock = videorender::makeShaderClock(
+                    displaySec, clockStart, clockDuration, activeBeatTimeline,
+                    clkFps, playing, frameIdx);
+                fillDescCommon(d, al.params, displaySec, al.seg.clipId);
             }
             else
             {

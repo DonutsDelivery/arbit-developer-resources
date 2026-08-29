@@ -45,6 +45,11 @@ int main()
     check (resolveSourceKind (SourceKind::Unspecified, false, "gen://shader")
                == SourceKind::Shader,
            "legacy shader sentinel remains readable");
+    check (resolveSourceKind (SourceKind::Unspecified, false, "gen://score")
+               == SourceKind::Score,
+           "legacy score sentinel remains readable");
+    check (videowire::sourceKindFromWire("score") == SourceKind::Score,
+           "structured score source kind round-trips");
     check (resolveSourceKind (SourceKind::Unspecified, false, "/tmp/movie.mov")
                == SourceKind::Media,
            "ordinary legacy path resolves to media");
@@ -69,6 +74,6 @@ int main()
     check (videowire::resolveTransitionFrom (segments, segments[1]) == &segments[0],
            "legacy transition falls back to previous overlapping track segment");
 
-    std::printf ("source-binding: %d/11 checks passed\n", 11 - failures);
+    std::printf ("source-binding: %d/13 checks passed\n", 13 - failures);
     return failures;
 }

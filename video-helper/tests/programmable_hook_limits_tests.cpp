@@ -2,6 +2,7 @@
 #include "lua_hook.h"
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <limits>
 #include <iostream>
@@ -26,6 +27,24 @@ int main()
 #if ARBIT_HAVE_QUICKJS
     {
         arbitjs::JsHook hook;
+        std::string error;
+        assert(hook.compile(
+            "function frame(ctx){const n=ctx.timelineNotes[0];return {probe:n.id+n.startBeat+"
+            "n.lengthBeats+n.age+n.remain+(n.active?1:0)+ctx.scoreHistoryBeats+"
+            "ctx.scoreLookaheadBeats+ctx.noteCount+ctx.timelineNoteCount};}", error, 50, 8));
+        arbitlua::HookNote note;
+        note.id = 7; note.startBeat = 2.0; note.lengthBeats = 3.0;
+        note.age = 4.0; note.remain = -1.0; note.active = true;
+        arbitlua::FrameCtx ctx;
+        ctx.notes = &note; ctx.noteCount = 1;
+        ctx.timelineNotes = &note; ctx.timelineNoteCount = 1;
+        ctx.scoreHistoryBeats = 8.0; ctx.scoreLookaheadBeats = 16.0;
+        std::map<std::string, double> output;
+        assert(hook.runFrame(ctx, output, error));
+        assert(std::abs(output["probe"] - 42.0) < 1.0e-9);
+    }
+    {
+        arbitjs::JsHook hook;
         expectBoundedFailure(hook, "for (;;) {}", 10, 8);
     }
     {
@@ -35,6 +54,24 @@ int main()
     }
 #endif
 #if ARBIT_HAVE_LUA
+    {
+        arbitlua::LuaHook hook;
+        std::string error;
+        assert(hook.compile(
+            "function frame(ctx) local n=ctx.timelineNotes[1] return {probe=n.id+n.startBeat+"
+            "n.lengthBeats+n.age+n.remain+(n.active and 1 or 0)+ctx.scoreHistoryBeats+"
+            "ctx.scoreLookaheadBeats+ctx.noteCount+ctx.timelineNoteCount} end", error, 50, 8));
+        arbitlua::HookNote note;
+        note.id = 7; note.startBeat = 2.0; note.lengthBeats = 3.0;
+        note.age = 4.0; note.remain = -1.0; note.active = true;
+        arbitlua::FrameCtx ctx;
+        ctx.notes = &note; ctx.noteCount = 1;
+        ctx.timelineNotes = &note; ctx.timelineNoteCount = 1;
+        ctx.scoreHistoryBeats = 8.0; ctx.scoreLookaheadBeats = 16.0;
+        std::map<std::string, double> output;
+        assert(hook.runFrame(ctx, output, error));
+        assert(std::abs(output["probe"] - 42.0) < 1.0e-9);
+    }
     {
         using State = arbitlua::LuaHook::AllocatorTestState;
         State state; state.maximum = 32;

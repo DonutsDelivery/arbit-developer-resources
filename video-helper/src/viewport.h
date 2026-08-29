@@ -257,7 +257,7 @@ public:
     // BlockCPacker (audio-tier note features are zero until the Block B live shm
     // lands). Empty score = the zero-feed (uNoteCount 0), byte-identical to
     // never calling this.
-    void setScore (arbitmod::Score score, double lookaheadBeats);
+    void setScore (arbitmod::Score score);
 
     // M6 mod-matrix live preview: the owned cross-domain routings (clock/score/
     // audio → clip param). Mirrors the export jobSpec's `modMatrix`; Arbit pushes
@@ -297,6 +297,7 @@ public:
     // reopen; applies on the next rendered frame. Returns "" on success.
     std::string setCanvas (int width, int height);
     void setCanvasFrameEnabled (bool enabled) { canvasFrameEnabled_ = enabled; }
+    std::string setView (double zoom, double panX, double panY);
 
     // Project canvas background colour (viewport_set_canvas_background) + the
     // bloom/tonemap post stack (viewport_set_post). Both are FRAME-GLOBAL render

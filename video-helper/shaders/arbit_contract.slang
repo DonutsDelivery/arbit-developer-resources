@@ -41,6 +41,8 @@ public uniform Sampler2D uLinks;             // 256 x 1 harmonic-link graph
 public uniform int    uNoteCount;
 public uniform int    uLinkCount;
 public uniform float  uRootFreq;             // song root frequency (Hz)
+public uniform float  uScoreHistoryBeats;    // visible beats behind playhead
+public uniform float  uScoreLookaheadBeats;  // visible beats ahead of playhead
 
 // --- Block D: camera (3D / SDF raymarch, P5) ------------------------------
 // Names + order mirror the GLSL prelude (shader_dialect.h arbitPrelude) verbatim

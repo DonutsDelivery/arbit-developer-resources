@@ -44,7 +44,7 @@ thread** writes it once per audio block: `{playing, playheadBeats, bpm,
 sampleTime, sampleRate, hostTimeNs}`. Transport version 2 also carries at most
 eight stable-track-ID feature slots (`tapPoint`, RMS, peak, onset) in the same
 seqlock transaction. These are bounded typed scalars derived from admitted
-Session Graph sources; no per-track raw-audio rings cross the process boundary.
+Patch Bay sources; no per-track raw-audio rings cross the process boundary.
 Missing/stale track owners evaluate to zero. Per-track spectral bands are not
 silently approximated in version 2: plans must use master `AudioBand` or a
 track/group RMS, peak, or onset source. Export rejects plans containing these
@@ -67,6 +67,7 @@ video chases.
 | `viewport_set_bounds` | `x, y, width, height` | Applied on the next render tick. |
 | `viewport_set_fullscreen` | `fullscreen` | Primary monitor. |
 | `viewport_set_canvas` | `width, height` | §Project canvas & view transform below. Accepted while closed (applies to the next open); survives close/reopen. |
+| `viewport_set_view` | `zoom, panX, panY` | Replaces the viewport-only view transform in one update. Use this for interactive pan/zoom so stale pointer events do not queue behind rendered frames. |
 
 Embedding/reparenting into the host editor is explicitly out of scope; the
 window floats (optionally always-on-top), matching Arbit's undock pattern.
@@ -85,7 +86,7 @@ export-frame coordinate space. When set (Arbit always sets it):
   (output NDC, x right / y down). Zooming out (< 1) really renders layer
   content that overflows the canvas — layers are not clipped to it.
 - A post-composite pass dims everything outside the canvas rect and draws a
-  crisp ~1.5 px violet border at the canvas bounds (constant thickness in
+  crisp ~1.5 px blue border at the canvas bounds (constant thickness in
   surface pixels at any zoom). Scopes keep measuring the undecorated
   composite; `frameHash` hashes the PRESENTED (framed) output.
 
@@ -103,7 +104,7 @@ under a top-level `canvas` object.
 ## Timeline
 
 `viewport_set_timeline {structuralRevision, matteContentRevision, segments: [{sourceKind?, sourcePath,
-clipId, isAdjustment?, inSec, outSec, rate, displayStartSec, matteAssetId?,
+clipId, isAdjustment?, inSec, outSec, rate, displayStartSec, clockStartSec?, clockDurationSec?, matteAssetId?,
 matteAssetVersion?, matteContentReceipt?, matteState?, matteCacheKey?, matteFramePrefix?,
 matteFrameExtension?, matteFirstFrame?, matteFrameDigits?, matteFps?, matteFrames?,
 transition?: {type, durationSec, fromClipId?, toClipId?}}]}` — the same constant-rate segment shape
@@ -127,7 +128,8 @@ or race pathname opens and is outside application authority; this protocol does 
 claim protection against same-principal process compromise.
 `sourceKind` is one of `media|shader|particles|adjustment`. When present it is
 authoritative; `isAdjustment` and `gen://` sentinels are fallback-only readers.
-Likewise, transition `fromClipId`/`toClipId` are authoritative A/B owners.
+Likewise, transition `fromClipId`/`toClipId` are authoritative A/B owners;
+`fromClipId: 0` explicitly selects black as A.
 Same-track timeline-order inference runs only when both structured IDs are absent.
 
 Preview and export pass this wire shape through the same immutable
@@ -178,6 +180,10 @@ v2 additions per segment (all optional, defaults preserve v1 behavior):
   ("img_%04d.png"), `sourceFps` sets the sequence frame rate and `seqStart`
   the first frame number. Ignored for regular media. The exporter's jobSpec
   segments accept the same two fields.
+- `clockStartSec` (double, default absent) + `clockDurationSec` (double,
+  default 0) keep a procedural clip's original clock while visibility splits
+  it into separate segments. Segment timing still controls contribution;
+  shader, particle, and score clocks use these fields when present.
 
 ## Alpha-channel sources
 
@@ -541,10 +547,10 @@ integral/inverse mapping. `bpm` (default 120) and `beatsPerBar` (default 4)
 remain compatibility fallbacks when the arrays are absent. Export and viewport
 use the same evaluator, so a beat-synced result exports exactly as it previews.
 
-### Session Graph video Control plan
+### Patch Bay video Control plan
 
-`controlPlan` is the bounded executable projection of every supported Session
-Graph Control closure ending at a video parameter sink. The same object is
+`controlPlan` is the bounded executable projection of every supported Patch Bay
+Control closure ending at a video parameter sink. The same object is
 embedded in export jobs and sent live with `viewport_set_control_plan`.
 
 - `version`: currently `1`.
@@ -579,7 +585,7 @@ jobSpec fields (on top of the original outPath/width/height/fps/codec/
 encoder/interpolation/audioPath/durationSec/startSec/endSec):
 
 - `segments: [{sourcePath, clipId, trackLayer, inSec, outSec, rate,
-  displayStartSec, transition?: {type, durationSec}}]` — the same
+  displayStartSec, clockStartSec?, clockDurationSec?, transition?: {type, durationSec}}]` — the same
   constant-rate spans `viewport_set_timeline` receives (speed ramps arrive
   already subdivided by Arbit; `transition` sits on the clip's FIRST slice).
 - `clips: [{clipId, scale, translateX, translateY, rotation, cropLeft,
@@ -653,14 +659,17 @@ encoder/interpolation/audioPath/durationSec/startSec/endSec):
   Entries with missing/undecodable pixels keep their timing but draw
   nothing. Text overlays render on the GL path only — the CPU fallback
   (`glCompositing: false`) skips compositing, including texts.
-- `score: {rootFreq, lookaheadBeats?, notes: [{id, trackId, startBeat,
-  lengthBeats, midiNote, velocity, freqHz, ratioNum, ratioDen,
+- `score: {rootFreq, historyBeats?, lookaheadBeats?, notes: [{id, trackId, startBeat,
+  lengthBeats, midiNote, velocity, freqHz, durationSeconds, pitchBendPoints,
+  pitchAnchors,
+  ratioNum, ratioDen,
   primes: [e2,e3,e5,e7,e11,e13], linkMasterId, isRoot}], links: [{id,
   slaveNoteId, masterNoteId, slaveHarmonic, masterHarmonic, octaveTranspose}]}`
   — the symbolic note/link timeline for shader generators' **Block C**
   (§Shader generators). The exporter runs the A2 packer over it once per frame
-  to fill `uNotes`/`uLinks`/`uNoteCount`/`uLinkCount`/`uRootFreq`. Omitted or
-  `notes: []` ⇒ Block C stays zero-fed. GL path only.
+  to fill `uNotes`/`uLinks`/`uNoteCount`/`uLinkCount`/`uRootFreq` and the score
+  window uniforms. `historyBeats` defaults to 8 and `lookaheadBeats` to 16.
+  Omitted or `notes: []` ⇒ Block C stays zero-fed. GL path only.
 - `modMatrix: [{source: {type, trackId?, pitchLo?, pitchHi?, primeIndex?, axis?,
   linkId?, band?, lissajousK?, triggerDecayBeats?, adsr?: {a,d,s,r,bend},
   lfo?: {shape, periodBeats, phase0, seed, hz, rateHz, retrigger}}, destination,
@@ -740,10 +749,15 @@ export path** — all without any shader change beyond new prelude accessors):
   M4 Slice B; the export path is live now.
 - **Block C — symbolic score** (M5): `uNotes` (a 4-texel × 128-row `RGBA32F`
   texture — per row: texel0 `midiNote, vel/127, ageBeats, remainBeats`; texel1
-  `freqHz, centsFromRoot, trackId, isRoot`; texel2 `e2,e3,e5,e7`; texel3
-  `e11,e13, masterRow, –`), `uLinks` (256×1 `RGBA32F`: `slaveRow, masterRow,
-  num, den` per edge), `uNoteCount` (highest occupied row + 1 — the loop bound,
-  covers freed-row holes), `uLinkCount`, `uRootFreq` (Hz). In the **export
+  `bentFreqHz, bentCentsFromRoot, trackId, isRoot`; texel2 `e2,e3,e5,e7`; texel3
+  `e11,e13, masterRow, bendSemitones`), `uLinks` (256×1 `RGBA32F`: `slaveRow, masterRow,
+  `num, den` per edge), `uNoteCount` (highest occupied row + 1 — the loop bound,
+  covers freed-row holes), `uLinkCount`, `uRootFreq` (Hz),
+  `uScoreHistoryBeats`, and `uScoreLookaheadBeats`. The default resident window
+  is 8 beats behind and 16 beats ahead of the playhead. Sounding notes have first
+  priority, upcoming notes second, and recently ended notes third. When more than
+  128 notes intersect the window, higher-priority notes deterministically evict
+  lower-priority history. In the **export
   path** the helper runs the in-house A2 packer (`block_c_packer.h`, the SAME
   voice allocator the live path will use) over the jobSpec `score` once per
   frame at the frame's mapped beat (== the Block A clock), in monotonic frame
@@ -753,15 +767,17 @@ export path** — all without any shader change beyond new prelude accessors):
   packer is **warmed from timeline frame 0** (a CPU-only catch-up on the first
   frame requested), so a frame-aligned *mid-timeline* range export gets the SAME
   rows as a from-the-top export at the same timeline instant; a non-frame-aligned
-  `startSec` snaps the warm-up grid to the nearest frame. Per-note CONTENT
-  (midi/freq/cents/age) is always beat-correct. An empty/absent `score` ⇒
+  `startSec` snaps the warm-up grid to the nearest frame. Per-note content
+  is always beat-correct. Finished resident notes have positive `ageBeats` and
+  negative `remainBeats`; future notes have negative `ageBeats`. An empty/absent `score` ⇒
   `uNoteCount`/`uLinkCount` 0
-  and the note/link samplers read black. Live-viewport Block C (live score) is a
-  later slice; the export path is live now. (`uChord`/`uLastOnsetBeat` are
+  and the note/link samplers read black. Live preview and export use the same
+  score schema and packer. (`uChord`/`uLastOnsetBeat` are
   reserved — declared in the generator, not in the v1 prelude.)
 - Helpers: `beatPulse(width)`, `hsv2rgb()`, `arbitGuard()`; `arbitBand(b)` for
-  Block B; and for Block C `arbitNoteMidi/Vel/Age/Remain/Freq/Cents/Track/IsRoot
-  (row)`, `arbitNotePrimesLo/Hi(row)`, `arbitNoteMasterRow(row)`,
+  Block B; and for Block C `arbitNoteMidi/Vel/Age/Remain/Length/StartOffset/
+  EndOffset/Freq/Cents/Track/IsRoot(row)`, `arbitNotePitch/Bend(row)`,
+  `arbitNotePrimesLo/Hi(row)`, `arbitNoteMasterRow(row)`,
   `arbitNoteActive(row)`, `arbitLink(edge)`, `arbitLinkRatio(edge)` — so a shader
   reads the packed score by note/link without touching raw texel layout. The
   full contract is live in the export path through M5.
@@ -884,9 +900,13 @@ overrides:
 function frame(ctx)
   -- ctx.t, ctx.beat, ctx.bpm, ctx.bar, ctx.frame                  (Block A clock)
   -- ctx.rms, ctx.peak, ctx.onset, ctx.onsetAge, ctx.bands[1..64]  (Block B audio)
-  -- ctx.notes[1..noteCount], ctx.noteCount, ctx.rootFreq          (Block C score)
-  --   each note: .midi .freq .velocity .cents .age .trackId .ratioNum .ratioDen
-  --              .isRoot .primes[1..6]  (exponents of 2,3,5,7,11,13)
+  -- ctx.notes[1..noteCount], ctx.noteCount                        (active notes, stable API)
+  -- ctx.timelineNotes[1..timelineNoteCount], ctx.timelineNoteCount (past/future window)
+  -- ctx.rootFreq                                                   (Block C root)
+  -- ctx.scoreHistoryBeats, ctx.scoreLookaheadBeats                (window bounds)
+  --   each note: .id .midi .freq .velocity .cents .startBeat .lengthBeats
+  --              .age .remain .active .trackId .ratioNum .ratioDen .isRoot
+  --              .primes[1..6]  (exponents of 2,3,5,7,11,13)
   -- ctx.links[1..linkCount], ctx.linkCount                         (harmonic edge graph)
   --   each link: .slave .master .num .den .ratio
   local lvl = ctx.rms
@@ -904,11 +924,12 @@ The returned ids use the same `clip<id>/<node>/<param>` namespace as
 mod-matrix → **Lua** — so a script wins wherever it sets a value (and leaves
 everything else to the layers below). `ctx` is exactly the mod-matrix's own
 inputs — Block A clock + Block B audio + Block C score — except the score is
-the **full sounding-note list** (`ctx.notes`, the notes active at this frame's
-beat, each with its JI cents/ratio and prime-exponent lattice coords
+the **full past/future timeline window** (`ctx.timelineNotes`, with exact start, length,
+age, remaining time, active state, JI cents/ratio, and prime-exponent lattice coords
 `.primes[1..6]`) plus the **harmonic link graph** (`ctx.links`), not just one
 source's filtered pick: the unique capability is a script reading the project's
-actual microtonal notes and their JI lattice.
+actual microtonal notes and their JI lattice. `ctx.notes` and `ctx.noteCount`
+remain the active-only view for existing scripts.
 
 **Sandbox:** a fresh `lua_State` with only the `base`/`table`/`string`/`math`
 stdlibs; `dofile`/`loadfile`/`load`/`require` and the whole `os`/`io` surface are

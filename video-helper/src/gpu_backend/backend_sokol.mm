@@ -1933,7 +1933,7 @@ fragment float4 _main(In in [[stage_in]], constant Params& p [[buffer(0)]],
     const bool spanY = in.uv.y >= p.rect.y - border * p.texel.y
                     && in.uv.y <= p.rect.w + border * p.texel.y;
     if ((dx <= border && spanY) || (dy <= border && spanX))
-        color = float4(0.61f, 0.42f, 0.87f, 1.0f);
+        color = float4(0.365f, 0.663f, 1.0f, 1.0f);
     return color;
 }
 )metal";
@@ -3651,8 +3651,15 @@ unsigned MetalFrameRenderer::renderComposite (const arbitgl::GlFuncs* gl,
                 ? static_cast<float> (displayWidth) / displayHeight : 1.0f;
             const float refAspect = impl_->canvasWidth > 0 && impl_->canvasHeight > 0
                 ? static_cast<float> (impl_->canvasWidth) / impl_->canvasHeight : outAspect;
-            const float videoAspect = layer.texHeight > 0
-                ? static_cast<float> (layer.texWidth) / layer.texHeight : 1.0f;
+            // Generated sources are rasterised into the compositor target and do
+            // not carry decoded-media dimensions in LayerDesc. Match the OpenGL
+            // path by treating them as full-canvas instead of falling back to a
+            // square source aspect.
+            const bool compositorSizedSource = layer.shaderSource || layer.particleSource;
+            const int sourceWidth = compositorSizedSource ? impl_->width : layer.texWidth;
+            const int sourceHeight = compositorSizedSource ? impl_->height : layer.texHeight;
+            const float videoAspect = sourceHeight > 0
+                ? static_cast<float> (sourceWidth) / sourceHeight : 1.0f;
             float lbx = 1.0f, lby = 1.0f;
             if (videoAspect > refAspect) lby = refAspect / videoAspect;
             else                         lbx = videoAspect / refAspect;

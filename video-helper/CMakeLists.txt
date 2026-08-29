@@ -32,10 +32,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(APPLE)
+    enable_language(OBJCXX)
     option(ARBIT_WITH_METAL "Enable the native sokol_gfx Metal backend" ON)
-    if(ARBIT_WITH_METAL)
-        enable_language(OBJCXX)
-    endif()
 endif()
 
 # Hardware accel: the decoder tries NVDEC/VAAPI (Linux), D3D11VA/NVDEC
@@ -125,6 +123,8 @@ if(GLFW3_FOUND AND OpenGL_FOUND)
     # extensions, context flavor) is probed at runtime and
     # viewport_open_shared fails cleanly without it.
     if(APPLE)
+        target_sources(arbit-video-helper PRIVATE src/mac_helper_application.mm)
+        target_link_libraries(arbit-video-helper PRIVATE "-framework Cocoa")
         if(ARBIT_WITH_METAL)
             # IOSurface-backed native Metal targets (global IOSurfaceIDs — no
             # fd passing). The shared path creates no OpenGL context.
@@ -616,6 +616,10 @@ add_test(NAME video_control_plan COMMAND arbit-video-control-plan-tests)
 
 add_test(NAME depth_primitives_source_contract
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/depth_primitives_source_contract.py)
+add_test(NAME bundled_shader_coordinate_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/bundled_shader_coordinate_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/../content/shader-packs)
 add_test(NAME rife_ncnn_async_submission_source_contract
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/rife_ncnn_async_submission_source_contract.py
@@ -627,6 +631,13 @@ if(NOT MSVC)
     target_compile_options(arbit-source-binding-tests PRIVATE -Wall -Wextra)
 endif()
 add_test(NAME source_binding COMMAND arbit-source-binding-tests)
+
+add_executable(arbit-score-renderer-tests tests/score_renderer_tests.cpp)
+target_include_directories(arbit-score-renderer-tests PRIVATE src)
+if(NOT MSVC)
+    target_compile_options(arbit-score-renderer-tests PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME score_renderer COMMAND arbit-score-renderer-tests)
 
 add_executable(arbit-render-snapshot-tests tests/render_snapshot_tests.cpp)
 target_include_directories(arbit-render-snapshot-tests PRIVATE src)
@@ -726,8 +737,10 @@ if(TARGET arbit-quickjs)
     target_link_libraries(programmable-hook-limits-tests PRIVATE arbit-quickjs)
     target_compile_definitions(programmable-hook-limits-tests PRIVATE ARBIT_HAVE_QUICKJS=1)
 endif()
-if(NOT MSVC)
-    target_compile_options(programmable-hook-limits-tests PRIVATE -Wall -Wextra)
+if(MSVC)
+    target_compile_options(programmable-hook-limits-tests PRIVATE /UNDEBUG)
+else()
+    target_compile_options(programmable-hook-limits-tests PRIVATE -Wall -Wextra -UNDEBUG)
 endif()
 add_test(NAME programmable_hook_limits COMMAND programmable-hook-limits-tests)
 set_tests_properties(programmable_hook_limits PROPERTIES TIMEOUT 30)

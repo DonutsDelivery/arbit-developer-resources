@@ -171,8 +171,15 @@ int main()
     auto duplicateClip = wire;
     duplicateClip["segments"][1]["clipId"] = 10;
     check (! videowire::parseSnapshotJson(duplicateClip, noShader, rejected, error)
-           && error == "snapshot duplicates a stable clip owner",
-           "duplicate stable clip owners are rejected");
+           && error == "snapshot duplicates or overlaps a stable clip owner",
+           "overlapping segments for one stable clip owner are rejected");
+    auto splitClip = wire;
+    splitClip["segments"][1]["clipId"] = 10;
+    splitClip["segments"][1]["displayStartSec"] = 3.0;
+    splitClip["segments"][1].erase("transition");
+    check (videowire::parseSnapshotJson(splitClip, noShader, rejected, error)
+           && rejected.segments.size() == 3,
+           "non-overlapping segments for one clip owner are accepted");
     auto traversalMatte = wire;
     traversalMatte["segments"][0]["matteCacheKey"] = "../outside";
     check (! videowire::parseSnapshotJson(traversalMatte, noShader, rejected, error)

@@ -154,6 +154,8 @@ struct NoteFeatures
     int   noteCount = 0;           // uNoteCount: highest occupied row + 1 (loop bound, covers holes)
     int   linkCount = 0;           // uLinkCount: link edges with both endpoints resident
     float rootFreq  = 261.625565f; // uRootFreq (Hz)
+    float historyBeats = 0.0f;     // uScoreHistoryBeats
+    float lookaheadBeats = 0.0f;   // uScoreLookaheadBeats
 };
 
 class ShaderGenerator
@@ -219,6 +221,7 @@ private:
         int uRMS = -1, uPeak = -1, uOnset = -1, uOnsetAge = -1;
         int uAudioBands = -1, uAudioBands2D = -1;
         int uNotes = -1, uLinks = -1, uNoteCount = -1, uLinkCount = -1;
+        int uScoreHistoryBeats = -1, uScoreLookaheadBeats = -1;
         int uLastOnsetBeat = -1, uRootFreq = -1, uChord = -1;
         // Block D — camera (P5 raymarch); -1 when the shader doesn't read them.
         int uCamPos = -1, uCamTarget = -1, uCamUp = -1;

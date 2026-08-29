@@ -3,10 +3,10 @@
 // Per-frame Lua hook (Media Machine M8 — "agent-programmable media machine").
 //
 // A single user/agent-authored Lua script drives render-graph clip params as an
-// arbitrary function of the frame's clock, the mix audio, and a coarse score
-// summary. It is the *general case* of the mod matrix: where a routing maps one
-// source through one curve to one destination, the hook is a Turing-complete
-// per-frame function returning any set of param overrides.
+// arbitrary function of the frame's clock, the mix audio, and the score's
+// past/future timeline window. A routing maps one source through one curve to one
+// destination. The hook can combine the whole context and return any set of
+// parameter overrides each frame.
 //
 //   -- the script defines a global `frame(ctx)` returning {paramId = value, ...}
 //   function frame(ctx)
@@ -45,16 +45,22 @@ extern "C" {
 
 namespace arbitlua
 {
-// One sounding note handed to the script as a ctx.notes[i] table. The JI data
+// One note record handed to the script through the active or timeline array.
+// The JI data
 // (cents, ratio) is what makes Arbit's scripting unique — no other tool's
 // per-frame hook can read the project's microtonal notes.
 struct HookNote
 {
+    int    id = 0;             // .id
     double midi = 60.0;      // .midi     — MIDI note number (may be fractional)
     double freq = 0.0;       // .freq     — resolved frequency (Hz, through the link chain)
     double velocity = 0.0;   // .velocity — 0..127
     double cents = 0.0;      // .cents    — cents from the JI root (centsFromRoot)
     double age = 0.0;        // .age      — beats since this note's onset
+    double remain = 0.0;     // .remain   — beats until note end (negative after end)
+    double startBeat = 0.0;  // .startBeat — absolute timeline beat
+    double lengthBeats = 0.0;// .lengthBeats
+    bool   active = false;   // .active   — sounding at ctx.beat
     int    trackId = 0;      // .trackId
     int    ratioNum = 1;     // .ratioNum — reduced interval vs root (numerator)
     int    ratioDen = 1;     // .ratioDen — denominator
@@ -89,12 +95,15 @@ struct FrameCtx
     float onsetAge = 0.0f;     // ctx.onsetAge
     const float* bands = nullptr;  // ctx.bands[1..bandCount] (1-indexed in Lua)
     int bandCount = 0;
-    // Block C score: the notes SOUNDING at this frame's beat (ctx.notes[1..N],
-    // 1-indexed), with their JI cents/ratio/prime-exponents — plus the root and
-    // the full harmonic link graph (ctx.links[1..linkCount], score-global).
+    // Existing active-note view, kept stable for script compatibility.
     const HookNote* notes = nullptr;
-    int    noteCount = 0;      // ctx.noteCount == #ctx.notes (active count)
+    int    noteCount = 0;
+    // Additive piano-roll view: the same past/future span the shader receives.
+    const HookNote* timelineNotes = nullptr;
+    int    timelineNoteCount = 0;
     double rootFreq = 0.0;     // ctx.rootFreq  — JI root frequency (Hz)
+    double scoreHistoryBeats = 0.0;
+    double scoreLookaheadBeats = 0.0;
     const HookLink* links = nullptr;
     int    linkCount = 0;      // ctx.linkCount == #ctx.links
 };
@@ -262,7 +271,7 @@ inline bool LuaHook::runFrame (const FrameCtx& ctx,
     lua_getglobal (L_, "frame");
 
     // Build the ctx table.
-    lua_createtable (L_, 0, 12);
+    lua_createtable (L_, 0, 19);
     auto setNum = [&] (const char* k, double v)
     { lua_pushnumber (L_, v); lua_setfield (L_, -2, k); };
     setNum ("t", ctx.t);
@@ -275,8 +284,11 @@ inline bool LuaHook::runFrame (const FrameCtx& ctx,
     setNum ("onset", ctx.onset);
     setNum ("onsetAge", ctx.onsetAge);
     setNum ("noteCount", (double) ctx.noteCount);
+    setNum ("timelineNoteCount", (double) ctx.timelineNoteCount);
     setNum ("linkCount", (double) ctx.linkCount);
     setNum ("rootFreq", ctx.rootFreq);
+    setNum ("scoreHistoryBeats", ctx.scoreHistoryBeats);
+    setNum ("scoreLookaheadBeats", ctx.scoreLookaheadBeats);
     // ctx.bands[1..N] (1-indexed, Lua convention).
     lua_createtable (L_, ctx.bandCount, 0);
     for (int i = 0; i < ctx.bandCount; ++i)
@@ -285,28 +297,38 @@ inline bool LuaHook::runFrame (const FrameCtx& ctx,
         lua_rawseti (L_, -2, i + 1);
     }
     lua_setfield (L_, -2, "bands");
-    // ctx.notes[1..noteCount] — the sounding notes with their JI data.
-    lua_createtable (L_, ctx.noteCount, 0);
-    for (int i = 0; i < ctx.noteCount; ++i)
+    auto pushNotes = [&] (const HookNote* notes, int count)
     {
-        const HookNote& n = ctx.notes[i];
-        lua_createtable (L_, 0, 9);
-        lua_pushnumber (L_, n.midi);      lua_setfield (L_, -2, "midi");
-        lua_pushnumber (L_, n.freq);      lua_setfield (L_, -2, "freq");
-        lua_pushnumber (L_, n.velocity);  lua_setfield (L_, -2, "velocity");
-        lua_pushnumber (L_, n.cents);     lua_setfield (L_, -2, "cents");
-        lua_pushnumber (L_, n.age);       lua_setfield (L_, -2, "age");
-        lua_pushinteger (L_, n.trackId);  lua_setfield (L_, -2, "trackId");
-        lua_pushinteger (L_, n.ratioNum); lua_setfield (L_, -2, "ratioNum");
-        lua_pushinteger (L_, n.ratioDen); lua_setfield (L_, -2, "ratioDen");
-        lua_pushboolean (L_, n.isRoot ? 1 : 0); lua_setfield (L_, -2, "isRoot");
-        lua_createtable (L_, 6, 0);                  // note.primes[1..6] = exps of 2,3,5,7,11,13
-        for (int p = 0; p < 6; ++p)
-        { lua_pushnumber (L_, n.primes[p]); lua_rawseti (L_, -2, p + 1); }
-        lua_setfield (L_, -2, "primes");
-        lua_rawseti (L_, -2, i + 1);
-    }
+        lua_createtable (L_, count, 0);
+        for (int i = 0; i < count; ++i)
+        {
+            const HookNote& n = notes[i];
+            lua_createtable (L_, 0, 15);
+            lua_pushinteger (L_, n.id);        lua_setfield (L_, -2, "id");
+            lua_pushnumber (L_, n.midi);      lua_setfield (L_, -2, "midi");
+            lua_pushnumber (L_, n.freq);      lua_setfield (L_, -2, "freq");
+            lua_pushnumber (L_, n.velocity);  lua_setfield (L_, -2, "velocity");
+            lua_pushnumber (L_, n.cents);     lua_setfield (L_, -2, "cents");
+            lua_pushnumber (L_, n.age);       lua_setfield (L_, -2, "age");
+            lua_pushnumber (L_, n.remain);    lua_setfield (L_, -2, "remain");
+            lua_pushnumber (L_, n.startBeat); lua_setfield (L_, -2, "startBeat");
+            lua_pushnumber (L_, n.lengthBeats); lua_setfield (L_, -2, "lengthBeats");
+            lua_pushboolean (L_, n.active ? 1 : 0); lua_setfield (L_, -2, "active");
+            lua_pushinteger (L_, n.trackId);  lua_setfield (L_, -2, "trackId");
+            lua_pushinteger (L_, n.ratioNum); lua_setfield (L_, -2, "ratioNum");
+            lua_pushinteger (L_, n.ratioDen); lua_setfield (L_, -2, "ratioDen");
+            lua_pushboolean (L_, n.isRoot ? 1 : 0); lua_setfield (L_, -2, "isRoot");
+            lua_createtable (L_, 6, 0);
+            for (int p = 0; p < 6; ++p)
+            { lua_pushnumber (L_, n.primes[p]); lua_rawseti (L_, -2, p + 1); }
+            lua_setfield (L_, -2, "primes");
+            lua_rawseti (L_, -2, i + 1);
+        }
+    };
+    pushNotes (ctx.notes, ctx.noteCount);
     lua_setfield (L_, -2, "notes");
+    pushNotes (ctx.timelineNotes, ctx.timelineNoteCount);
+    lua_setfield (L_, -2, "timelineNotes");
     // ctx.links[1..linkCount] — the harmonic link graph (score-global).
     lua_createtable (L_, ctx.linkCount, 0);
     for (int i = 0; i < ctx.linkCount; ++i)

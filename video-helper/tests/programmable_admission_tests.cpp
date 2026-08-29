@@ -97,9 +97,9 @@ int main()
     nlohmann::json isfOwner={{"shaderSource",isfSource},{"runtimeKind","shader"},
                              {"runtimeGrant",programmableadmission::toJson(isfGrant)}};
     programmableadmission::SessionVerifier isfSession(secret,generation);
-    error.clear(); assert(!programmableadmission::admitCatalogGpuField(
+    error.clear(); assert(programmableadmission::admitCatalogGpuField(
         isfSession,isfOwner,"shaderSource","runtimeGrant",rawGrant,error,now));
-    assert(error=="sandbox unavailable");
+    assert(error.empty());
 
     auto forged=programmableadmission::toJson(g); forged["nonce"]=5; forged["cpuMs"]=26;
     error.clear(); assert(!verifier.admit(forged,PayloadKind::shader,source,parsed,error,now));

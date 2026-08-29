@@ -34,21 +34,71 @@ double streamTimeToSec (const AVStream* st, int64_t ts)
     return (double) ts * st->time_base.num / st->time_base.den;
 }
 
-// get_format callback for hardware decoding: prefer the negotiated hw pixel
-// format, fall back to the first software format the decoder offers.
-AVPixelFormat getHwFormat (AVCodecContext* ctx, const AVPixelFormat* fmts)
+const AVHWDeviceType* preferredHwDeviceTypes()
 {
-    const auto desired = (AVPixelFormat) (intptr_t) ctx->opaque;
-    for (const AVPixelFormat* p = fmts; *p != AV_PIX_FMT_NONE; ++p)
-        if (*p == desired)
-            return *p;
-    for (const AVPixelFormat* p = fmts; *p != AV_PIX_FMT_NONE; ++p)
-        if (av_pix_fmt_desc_get (*p) != nullptr
-            && (av_pix_fmt_desc_get (*p)->flags & AV_PIX_FMT_FLAG_HWACCEL) == 0)
-            return *p;
-    return fmts[0];
+    static const AVHWDeviceType preferred[] = {
+#if defined(__APPLE__)
+        AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+#elif defined(_WIN32)
+        AV_HWDEVICE_TYPE_D3D11VA,
+        AV_HWDEVICE_TYPE_CUDA,
+#else
+        AV_HWDEVICE_TYPE_CUDA,
+        AV_HWDEVICE_TYPE_VAAPI,
+#endif
+        AV_HWDEVICE_TYPE_NONE
+    };
+    return preferred;
+}
+
+bool decoderSupportsDevice (const AVCodec* codec, AVHWDeviceType deviceType)
+{
+    for (int i = 0;; ++i)
+    {
+        const AVCodecHWConfig* cfg = avcodec_get_hw_config (codec, i);
+        if (cfg == nullptr) return false;
+        if ((cfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) != 0
+            && cfg->device_type == deviceType)
+            return true;
+    }
+}
+
+const AVCodec* findHardwareDecoder (AVCodecID codecId)
+{
+    for (const AVHWDeviceType* device = preferredHwDeviceTypes();
+         *device != AV_HWDEVICE_TYPE_NONE; ++device)
+    {
+        void* iterator = nullptr;
+        while (const AVCodec* candidate = av_codec_iterate (&iterator))
+            if (av_codec_is_decoder (candidate) && candidate->id == codecId
+                && decoderSupportsDevice (candidate, *device))
+                return candidate;
+    }
+    return nullptr;
 }
 } // namespace
+
+AVPixelFormat MediaContext::getHwFormat (AVCodecContext* context,
+                                         const AVPixelFormat* formats)
+{
+    auto* media = static_cast<MediaContext*> (context->opaque);
+    const auto desired = media != nullptr ? media->hwPixFmt_ : AV_PIX_FMT_NONE;
+    for (const AVPixelFormat* format = formats; *format != AV_PIX_FMT_NONE; ++format)
+        if (*format == desired)
+            return *format;
+
+    // Device creation can succeed before FFmpeg checks the stream's profile,
+    // bit depth, chroma, and dimensions. Record a rejected hardware format so
+    // getFrame can reopen the original software decoder instead of leaving an
+    // alternative native decoder in an accidental software mode.
+    if (media != nullptr)
+        media->hardwareFallbackRequested_.store (true, std::memory_order_release);
+    for (const AVPixelFormat* format = formats; *format != AV_PIX_FMT_NONE; ++format)
+        if (av_pix_fmt_desc_get (*format) != nullptr
+            && (av_pix_fmt_desc_get (*format)->flags & AV_PIX_FMT_FLAG_HWACCEL) == 0)
+            return *format;
+    return formats[0];
+}
 
 AVBufferRef* sharedCudaDeviceCtx()
 {
@@ -76,40 +126,20 @@ AVBufferRef* sharedCudaDeviceCtx()
 
 bool MediaContext::tryOpenHwDecoder (const AVCodec* codec)
 {
-    // Platform preference order; each is tried only if this FFmpeg build and
-    // the running machine actually support it (runtime fallback to software).
-    static const AVHWDeviceType preferred[] = {
-#if defined(__APPLE__)
-        AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
-#elif defined(_WIN32)
-        AV_HWDEVICE_TYPE_D3D11VA,
-        AV_HWDEVICE_TYPE_CUDA,
-#else
-        AV_HWDEVICE_TYPE_CUDA,        // NVDEC
-        AV_HWDEVICE_TYPE_VAAPI,
-#endif
-        AV_HWDEVICE_TYPE_NONE
-    };
-
-    for (int t = 0; preferred[t] != AV_HWDEVICE_TYPE_NONE; ++t)
+    // Each backend is tried only if this decoder, FFmpeg build, and running
+    // machine support it. Failures fall through to the next backend, then software.
+    for (const AVHWDeviceType* device = preferredHwDeviceTypes();
+         *device != AV_HWDEVICE_TYPE_NONE; ++device)
     {
-        // Does this decoder expose a hw config for the device type?
         AVPixelFormat hwFmt = AV_PIX_FMT_NONE;
-        for (int i = 0;; ++i)
-        {
-            const AVCodecHWConfig* cfg = avcodec_get_hw_config (codec, i);
-            if (cfg == nullptr) break;
+        for (int i = 0; const AVCodecHWConfig* cfg = avcodec_get_hw_config (codec, i); ++i)
             if ((cfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) != 0
-                && cfg->device_type == preferred[t])
-            {
-                hwFmt = cfg->pix_fmt;
-                break;
-            }
-        }
+                && cfg->device_type == *device)
+            { hwFmt = cfg->pix_fmt; break; }
         if (hwFmt == AV_PIX_FMT_NONE) continue;
 
         AVBufferRef* deviceCtx = nullptr;
-        if (preferred[t] == AV_HWDEVICE_TYPE_CUDA)
+        if (*device == AV_HWDEVICE_TYPE_CUDA)
         {
             // Reference the ONE shared CUDA device context instead of creating a
             // new one here — av_buffer_ref only bumps a refcount, so no second
@@ -129,15 +159,16 @@ bool MediaContext::tryOpenHwDecoder (const AVCodec* codec)
             deviceCtx = av_buffer_ref (shared);
             if (deviceCtx == nullptr) continue;
         }
-        else if (av_hwdevice_ctx_create (&deviceCtx, preferred[t], nullptr, nullptr, 0) < 0)
+        else if (av_hwdevice_ctx_create (&deviceCtx, *device, nullptr, nullptr, 0) < 0)
             continue;
 
         hwDeviceCtx_ = deviceCtx;
         hwPixFmt_ = hwFmt;
+        hardwareFallbackRequested_.store (false, std::memory_order_release);
         videoDec_->hw_device_ctx = av_buffer_ref (deviceCtx);
-        videoDec_->opaque = (void*) (intptr_t) hwFmt;
-        videoDec_->get_format = getHwFormat;
-        info_.hwaccel = av_hwdevice_get_type_name (preferred[t]);
+        videoDec_->opaque = this;
+        videoDec_->get_format = &MediaContext::getHwFormat;
+        info_.hwaccel = av_hwdevice_get_type_name (*device);
         return true;
     }
     return false;
@@ -207,17 +238,29 @@ std::string MediaContext::open (const std::string& path, bool allowHwDecode,
             if (const auto* e = av_dict_get (st->metadata, "alpha_mode", nullptr, 0))
                 vpxAlpha = std::strcmp (e->value, "1") == 0;
 
-        const AVCodec* codec = nullptr;
+        const AVCodec* softwareCodec = nullptr;
         if (vpxAlpha)
-            codec = avcodec_find_decoder_by_name (
+            softwareCodec = avcodec_find_decoder_by_name (
                 st->codecpar->codec_id == AV_CODEC_ID_VP9 ? "libvpx-vp9" : "libvpx");
-        if (codec == nullptr)
+        if (softwareCodec == nullptr)
         {
             vpxAlpha = false; // native vp8/vp9 decoders drop the alpha plane
-            codec = avcodec_find_decoder (st->codecpar->codec_id);
+            softwareCodec = avcodec_find_decoder (st->codecpar->codec_id);
         }
-        if (codec == nullptr) return "no video decoder for codec";
+        if (softwareCodec == nullptr) return "no video decoder for codec";
+        softwareVideoCodec_ = softwareCodec;
         info_.hasAlpha = fmtHasAlpha || vpxAlpha;
+
+        // avcodec_find_decoder() can prefer a software-only wrapper even when
+        // FFmpeg also ships a decoder for the same codec with a hardware config.
+        // AV1 commonly resolves to libdav1d this way, leaving 4K preview on the
+        // CPU despite working NVDEC/VAAPI support. Pick the first decoder matching
+        // our backend order when hardware decode is allowed, but retain the
+        // original software decoder for a clean open-time fallback.
+        const AVCodec* codec = softwareCodec;
+        if (allowHwDecode && ! info_.hasAlpha)
+            if (const AVCodec* hardwareCodec = findHardwareDecoder (st->codecpar->codec_id))
+                codec = hardwareCodec;
 
         videoDec_ = avcodec_alloc_context3 (codec);
         avcodec_parameters_to_context (videoDec_, st->codecpar);
@@ -226,6 +269,17 @@ std::string MediaContext::open (const std::string& path, bool allowHwDecode,
         // Never hardware-decode alpha sources: hw surfaces are NV12/P010 and
         // the alpha plane would be silently dropped on download.
         const bool wantHw = allowHwDecode && ! info_.hasAlpha && tryOpenHwDecoder (codec);
+        if (! wantHw && codec != softwareCodec)
+        {
+            // A matching FFmpeg decoder exists, but none of its advertised
+            // devices opened on this machine. Do not leave playback on a slower
+            // native decoder when the normal threaded software decoder is available.
+            avcodec_free_context (&videoDec_);
+            codec = softwareCodec;
+            videoDec_ = avcodec_alloc_context3 (codec);
+            avcodec_parameters_to_context (videoDec_, st->codecpar);
+            videoDec_->thread_count = 0;
+        }
         rc = avcodec_open2 (videoDec_, codec, nullptr);
         if (rc < 0 && wantHw)
         {
@@ -233,7 +287,9 @@ std::string MediaContext::open (const std::string& path, bool allowHwDecode,
             avcodec_free_context (&videoDec_);
             if (hwDeviceCtx_ != nullptr) av_buffer_unref (&hwDeviceCtx_);
             hwPixFmt_ = AV_PIX_FMT_NONE;
+            hardwareFallbackRequested_.store (false, std::memory_order_release);
             info_.hwaccel.clear();
+            codec = softwareCodec;
             videoDec_ = avcodec_alloc_context3 (codec);
             avcodec_parameters_to_context (videoDec_, st->codecpar);
             videoDec_->thread_count = 0;
@@ -287,17 +343,62 @@ bool MediaContext::openAudioDecoder (std::string& error)
 
 void MediaContext::downloadIfHw (AVFrame* frame)
 {
-    if (hwPixFmt_ == AV_PIX_FMT_NONE || frame->format != hwPixFmt_)
+    if (hwPixFmt_ == AV_PIX_FMT_NONE)
         return;
+    if (frame->format != hwPixFmt_)
+    {
+        hardwareFallbackRequested_.store (true, std::memory_order_release);
+        return;
+    }
     if (hwTransferFrame_ == nullptr)
         hwTransferFrame_ = av_frame_alloc();
     av_frame_unref (hwTransferFrame_);
-    if (av_hwframe_transfer_data (hwTransferFrame_, frame, 0) == 0)
+    if (av_hwframe_transfer_data (hwTransferFrame_, frame, 0) != 0)
+    {
+        hardwareFallbackRequested_.store (true, std::memory_order_release);
+    }
+    else
     {
         av_frame_copy_props (hwTransferFrame_, frame);
         av_frame_unref (frame);
         av_frame_move_ref (frame, hwTransferFrame_);
     }
+}
+
+std::string MediaContext::reopenSoftwareVideoDecoder (double targetSec)
+{
+    if (softwareVideoCodec_ == nullptr)
+        return "original software decoder is unavailable";
+
+    av_frame_unref (lastFrame_);
+    if (hwTransferFrame_ != nullptr)
+        av_frame_unref (hwTransferFrame_);
+    avcodec_free_context (&videoDec_);
+    if (hwDeviceCtx_ != nullptr)
+        av_buffer_unref (&hwDeviceCtx_);
+    hwPixFmt_ = AV_PIX_FMT_NONE;
+    hardwareFallbackRequested_.store (false, std::memory_order_release);
+    info_.hwaccel.clear();
+
+    auto* stream = fmt_->streams[videoStream_];
+    videoDec_ = avcodec_alloc_context3 (softwareVideoCodec_);
+    if (videoDec_ == nullptr)
+        return "software decoder allocation failed";
+    avcodec_parameters_to_context (videoDec_, stream->codecpar);
+    videoDec_->thread_count = 0;
+    const int openResult = avcodec_open2 (videoDec_, softwareVideoCodec_, nullptr);
+    if (openResult < 0)
+        return "software decoder open failed: " + avErr (openResult);
+
+    const int64_t timestamp = (int64_t) std::llround (
+        targetSec * stream->time_base.den / (double) stream->time_base.num);
+    const int seekResult = av_seek_frame (fmt_, videoStream_, timestamp, AVSEEK_FLAG_BACKWARD);
+    if (seekResult < 0)
+        return "software fallback seek failed: " + avErr (seekResult);
+    avcodec_flush_buffers (videoDec_);
+    lastDecodedPts_ = -1.0e9;
+    info_.videoCodec = softwareVideoCodec_->name;
+    return {};
 }
 
 std::string MediaContext::decodeForwardUntil (double targetSec, AVFrame* frame, bool& gotFrame)
@@ -308,44 +409,87 @@ std::string MediaContext::decodeForwardUntil (double targetSec, AVFrame* frame, 
     const double frameDur = info_.fps > 0.0 ? 1.0 / info_.fps : 1.0 / 30.0;
 
     std::string error;
+    bool draining = false;
+    bool havePendingPacket = false;
     while (true)
     {
-        int rc = av_read_frame (fmt_, pkt);
-        if (rc == AVERROR_EOF)
-        {
-            // flush
-            avcodec_send_packet (videoDec_, nullptr);
-            while (avcodec_receive_frame (videoDec_, frame) == 0)
-            {
-                downloadIfHw (frame);
-                gotFrame = true;
-                lastDecodedPts_ = streamTimeToSec (st, frame->best_effort_timestamp);
-                if (lastDecodedPts_ + frameDur > targetSec) break;
-            }
-            avcodec_flush_buffers (videoDec_);
-            break;
-        }
-        if (rc < 0) { error = "read frame failed: " + avErr (rc); break; }
-
-        if (pkt->stream_index != videoStream_)
-        {
-            av_packet_unref (pkt);
-            continue;
-        }
-
-        rc = avcodec_send_packet (videoDec_, pkt);
-        av_packet_unref (pkt);
-        if (rc < 0 && rc != AVERROR (EAGAIN)) { error = "send packet failed: " + avErr (rc); break; }
-
-        bool reached = false;
-        while (avcodec_receive_frame (videoDec_, frame) == 0)
+        // Always drain queued output before reading another packet. A prior
+        // request can return as soon as it finds its target frame while the
+        // decoder still holds later frames from the same accepted packet.
+        int receiveResult = 0;
+        while ((receiveResult = avcodec_receive_frame (videoDec_, frame)) == 0)
         {
             downloadIfHw (frame);
             gotFrame = true;
             lastDecodedPts_ = streamTimeToSec (st, frame->best_effort_timestamp);
-            if (lastDecodedPts_ + frameDur > targetSec) { reached = true; break; }
+            if (lastDecodedPts_ + frameDur > targetSec)
+                break;
         }
-        if (reached) break;
+        if (gotFrame && lastDecodedPts_ + frameDur > targetSec)
+            break;
+        if (receiveResult == AVERROR_EOF)
+            break;
+        if (receiveResult != AVERROR (EAGAIN))
+        {
+            if (hwPixFmt_ != AV_PIX_FMT_NONE)
+                hardwareFallbackRequested_.store (true, std::memory_order_release);
+            error = "receive frame failed: " + avErr (receiveResult);
+            break;
+        }
+
+        if (draining)
+        {
+            const int sendResult = avcodec_send_packet (videoDec_, nullptr);
+            if (sendResult == 0)
+                continue;
+            if (sendResult == AVERROR_EOF)
+                break;
+            if (hwPixFmt_ != AV_PIX_FMT_NONE)
+                hardwareFallbackRequested_.store (true, std::memory_order_release);
+            error = "flush packet failed: " + avErr (sendResult);
+            break;
+        }
+
+        if (! havePendingPacket)
+        {
+            int readResult = 0;
+            while (true)
+            {
+                readResult = av_read_frame (fmt_, pkt);
+                if (readResult < 0 || pkt->stream_index == videoStream_)
+                    break;
+                av_packet_unref (pkt);
+            }
+
+            if (readResult == AVERROR_EOF)
+            {
+                draining = true;
+                continue;
+            }
+            if (readResult < 0)
+            {
+                error = "read frame failed: " + avErr (readResult);
+                break;
+            }
+            havePendingPacket = true;
+        }
+
+        const int sendResult = avcodec_send_packet (videoDec_, pkt);
+        if (sendResult == AVERROR (EAGAIN))
+        {
+            // The packet was not accepted. Keep it intact, drain output, and
+            // retry instead of silently skipping compressed input.
+            continue;
+        }
+        av_packet_unref (pkt);
+        havePendingPacket = false;
+        if (sendResult < 0)
+        {
+            if (hwPixFmt_ != AV_PIX_FMT_NONE)
+                hardwareFallbackRequested_.store (true, std::memory_order_release);
+            error = "send packet failed: " + avErr (sendResult);
+            break;
+        }
     }
 
     av_packet_free (&pkt);
@@ -411,6 +555,18 @@ std::string MediaContext::getFrame (double timeSec, int maxW, int maxH, DecodedF
 
     bool gotFrame = false;
     auto error = decodeForwardUntil (timeSec, lastFrame_, gotFrame);
+    if (hwPixFmt_ != AV_PIX_FMT_NONE
+        && hardwareFallbackRequested_.exchange (false, std::memory_order_acq_rel))
+    {
+        std::fprintf (stderr,
+                      "[media] hardware decode rejected at frame decode; reopening with %s\n",
+                      softwareVideoCodec_ != nullptr ? softwareVideoCodec_->name : "software");
+        const auto fallbackError = reopenSoftwareVideoDecoder (timeSec);
+        if (! fallbackError.empty())
+            return "hardware decode failed; " + fallbackError;
+        gotFrame = false;
+        error = decodeForwardUntil (timeSec, lastFrame_, gotFrame);
+    }
     if (! error.empty()) return error;
     if (! gotFrame) return "no frame decoded at requested time";
     out.ptsSec = lastDecodedPts_;

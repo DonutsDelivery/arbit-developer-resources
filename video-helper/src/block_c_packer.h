@@ -5,8 +5,8 @@
 //
 // The differentiator vs. an FFT visualiser is that row assignment is a STATEFUL
 // VOICE ALLOCATOR, not a per-frame sort: a note gets a row when it enters the
-// residency window (active or within the ~1-bar lookahead) and keeps that row
-// until it leaves; rows free on exit and are reused. masterRow and the uLinks
+// past/future timeline window and keeps that row while it remains selected;
+// rows free on exit and are reused. masterRow and the uLinks
 // row indices therefore stay valid for a note's entire residency, so age- and
 // row-keyed shader effects don't jump when an unrelated note enters or leaves.
 //
@@ -32,6 +32,7 @@
 
 #include <array>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace arbitblockc
@@ -44,7 +45,6 @@ using arbitmod::Score;
 constexpr int kMaxNotes  = 128;
 constexpr int kMaxLinks  = 256;
 constexpr int kTexelsPerNote = 4;
-constexpr float kDefaultLookaheadBeats = 4.0f;   // ~1 bar in 4/4
 
 struct PackResult
 {
@@ -67,13 +67,12 @@ public:
         noteToRow_.clear();
     }
 
-    // Priority: 2 = active (sounding now), 1 = upcoming within lookahead,
-    // 0 = not resident. Eviction and assignment order both use this.
-    static int residency (const Note& n, float beat, float lookahead)
+    // Priority: sounding > upcoming > recently ended. Selection applies this
+    // before row assignment so lower-priority history cannot starve new notes.
+    static int residency (const Note& n, float beat,
+                          float historyBeats, float lookaheadBeats)
     {
-        if (n.activeAt (beat)) return 2;
-        if (n.startBeat > beat && n.startBeat <= beat + lookahead) return 1;
-        return 0;
+        return arbitmod::timelineResidency (n, beat, historyBeats, lookaheadBeats);
     }
 
     int rowOf (int noteId) const
@@ -82,51 +81,70 @@ public:
         return it == noteToRow_.end() ? -1 : it->second;
     }
 
-    PackResult pack (const Score& score, float beat,
-                     float lookahead = kDefaultLookaheadBeats)
+    PackResult pack (const Score& score, float beat)
     {
-        // 1. Free rows of notes that are no longer resident.
+        return pack (score, beat, score.historyBeats, score.lookaheadBeats);
+    }
+
+    PackResult pack (const Score& score, float beat,
+                     float historyBeats, float lookaheadBeats)
+    {
+        // 1. Select the best bounded resident set. Within a class, sounding and
+        // upcoming notes sort by onset; history sorts newest end first.
+        struct Candidate { const Note* note; int priority; };
+        std::vector<Candidate> candidates;
+        candidates.reserve (score.notes.size());
+        for (const auto& note : score.notes)
+        {
+            if (note.muted)
+                continue;
+            const int priority = residency (note, beat, historyBeats, lookaheadBeats);
+            if (priority > 0)
+                candidates.push_back ({ &note, priority });
+        }
+        std::sort (candidates.begin(), candidates.end(),
+                   [] (const Candidate& a, const Candidate& b)
+                   {
+                       if (a.priority != b.priority) return a.priority > b.priority;
+                       if (a.priority == 1 && a.note->endBeat() != b.note->endBeat())
+                           return a.note->endBeat() > b.note->endBeat();
+                       if (a.note->startBeat != b.note->startBeat)
+                           return a.note->startBeat < b.note->startBeat;
+                       return a.note->id < b.note->id;
+                   });
+        if (candidates.size() > static_cast<size_t> (kMaxNotes))
+            candidates.resize (kMaxNotes);
+
+        std::unordered_set<int> selectedIds;
+        selectedIds.reserve (candidates.size());
+        for (const auto& candidate : candidates)
+            selectedIds.insert (candidate.note->id);
+
+        // 2. Free rows outside the selected set. This is the capacity-aware
+        // eviction step: active/upcoming entrants can displace older history.
         for (int row = 0; row < kMaxNotes; ++row)
         {
             const int id = rowToNote_[row];
             if (id < 0) continue;
-            const Note* n = score.noteById (id);
-            if (n == nullptr || residency (*n, beat, lookahead) == 0)
+            if (selectedIds.find (id) == selectedIds.end())
             {
                 rowToNote_[row] = -1;
                 noteToRow_.erase (id);
             }
         }
 
-        // 2. Collect entrants (resident, no row yet), highest priority first;
-        //    within a priority, nearest in time, then id for determinism.
-        struct Entrant { const Note* note; int prio; };
-        std::vector<Entrant> entrants;
-        for (const auto& n : score.notes)
+        // 3. Assign the selected entrants to the lowest free rows. Notes that
+        // survived selection keep their old rows, preserving motion continuity.
+        for (const auto& candidate : candidates)
         {
-            const int prio = residency (n, beat, lookahead);
-            if (prio > 0 && noteToRow_.find (n.id) == noteToRow_.end())
-                entrants.push_back ({ &n, prio });
-        }
-        std::sort (entrants.begin(), entrants.end(),
-                   [] (const Entrant& a, const Entrant& b)
-                   {
-                       if (a.prio != b.prio) return a.prio > b.prio;
-                       if (a.note->startBeat != b.note->startBeat)
-                           return a.note->startBeat < b.note->startBeat;
-                       return a.note->id < b.note->id;
-                   });
-
-        // 3. Assign lowest free row to each entrant; when full, lowest-priority
-        //    entrants are simply dropped (never displace a surviving note).
-        for (const auto& e : entrants)
-        {
+            if (noteToRow_.find (candidate.note->id) != noteToRow_.end())
+                continue;
             int freeRow = -1;
             for (int row = 0; row < kMaxNotes; ++row)
                 if (rowToNote_[row] < 0) { freeRow = row; break; }
-            if (freeRow < 0) break;                  // capacity reached
-            rowToNote_[freeRow] = e.note->id;
-            noteToRow_[e.note->id] = freeRow;
+            if (freeRow < 0) break;
+            rowToNote_[freeRow] = candidate.note->id;
+            noteToRow_[candidate.note->id] = freeRow;
         }
 
         // 4. Emit textures.
@@ -175,7 +193,10 @@ private:
         const float vel   = arbitmod::clamp01 (n.velocity / 127.0f);
         const float age   = beat - n.startBeat;        // negative for lookahead notes
         const float remain = n.endBeat() - beat;
-        const float cents = arbitmod::centsFromRoot (n.freqHz, score.rootFreq);
+        const float bentFrequency = arbitmod::pitchFrequencyAtBeat (n, beat);
+        const float bendSemitones = n.freqHz > 0.0f && bentFrequency > 0.0f
+            ? 12.0f * std::log2 (bentFrequency / n.freqHz) : 0.0f;
+        const float cents = arbitmod::centsFromRoot (bentFrequency, score.rootFreq);
         const int   masterRow = (n.linkMasterId >= 0) ? rowOf (n.linkMasterId) : -1;
 
         // texel0: midiNote, velocity/127, ageBeats, remainBeats
@@ -183,8 +204,8 @@ private:
         set (tex, row, 0, 1, vel);
         set (tex, row, 0, 2, age);
         set (tex, row, 0, 3, remain);
-        // texel1: freqHz, centsFromRoot, trackId, isRoot
-        set (tex, row, 1, 0, n.freqHz);
+        // texel1: frame-resolved freqHz, centsFromRoot, trackId, isRoot
+        set (tex, row, 1, 0, bentFrequency);
         set (tex, row, 1, 1, cents);
         set (tex, row, 1, 2, static_cast<float> (n.trackId));
         set (tex, row, 1, 3, n.isRoot ? 1.0f : 0.0f);
@@ -193,11 +214,11 @@ private:
         set (tex, row, 2, 1, n.primes[1]);
         set (tex, row, 2, 2, n.primes[2]);
         set (tex, row, 2, 3, n.primes[3]);
-        // texel3: e11,e13, masterRow, reserved
+        // texel3: e11,e13, masterRow, pitch bend in semitones
         set (tex, row, 3, 0, n.primes[4]);
         set (tex, row, 3, 1, n.primes[5]);
         set (tex, row, 3, 2, static_cast<float> (masterRow));
-        set (tex, row, 3, 3, 0.0f);
+        set (tex, row, 3, 3, bendSemitones);
     }
 
     std::array<int, kMaxNotes> rowToNote_ {};

@@ -224,7 +224,6 @@ struct ExportJob
     // non-viewport builds (mod_defs.h is plain C++17 with no GL/GPL); only
     // consumed by the GL frame loop.
     arbitmod::Score score;
-    double scoreLookaheadBeats = 4.0;   // residency lookahead in beats (~1 bar in 4/4)
 
     // Cross-domain modulation matrix (M6 — "the music moves the picture"). Each
     // routing maps a musical SOURCE (Block A clock / Block B audio / Block C
@@ -251,9 +250,9 @@ struct ExportJob
     // "clip<id>/<node>/<param>" -> value overrides — the Turing-complete general
     // case of the mod matrix. Applied as the TOP layer in stateAt (static -> ISF
     // default -> baked -> mod-matrix -> Lua), so the script wins where it sets a
-    // value. ctx carries the frame's clock (t/beat/bpm/bar/frame), Block B audio
-    // (rms/peak/onset/onsetAge/bands) and a coarse Block C summary
-    // (noteCount/rootFreq). The lua_State persists for the whole export and is
+    // value. ctx carries the frame's clock (t/beat/bpm/bar/frame), Block B audio,
+    // and the Block C past/future note window with exact note timing. The
+    // lua_State persists for the whole export and is
     // warmed from timeline frame 0 (like the score packer / routing driver) so a
     // script that keeps cross-frame state in globals stays deterministic across a
     // mid-range export. Empty ⇒ no hook. Inert (no-op) in builds without Lua.
