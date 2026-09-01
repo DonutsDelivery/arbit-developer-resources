@@ -2722,9 +2722,23 @@ int main (int argc, char** argv)
     bool testPrivateFdClosed = false, testMarkerInArgvOrEnv = false;
     bool testPacketZero = false, testSourceZero = false;
 #endif
-#if ! defined(_WIN32)
     std::array<uint8_t, programmableruntime::privatepayload::packetSize> sessionPacket {};
-    if (! programmableruntime::privatepayload::readOneShot(3, sessionPacket))
+#if defined(_WIN32)
+    const auto privateHandleText = std::getenv("ARBIT_PRIVATE_PAYLOAD_HANDLE");
+    char* privateHandleEnd = nullptr;
+    const auto privateHandleValue = privateHandleText != nullptr
+        ? std::strtoull(privateHandleText, &privateHandleEnd, 10) : 0;
+    const bool privateHandleValid = privateHandleText != nullptr
+        && privateHandleEnd != privateHandleText && *privateHandleEnd == '\0'
+        && privateHandleValue != 0;
+    _putenv_s("ARBIT_PRIVATE_PAYLOAD_HANDLE", "");
+    const bool privatePayloadRead = privateHandleValid
+        && programmableruntime::privatepayload::readOneShot(
+            reinterpret_cast<HANDLE>(static_cast<uintptr_t>(privateHandleValue)), sessionPacket);
+#else
+    const bool privatePayloadRead = programmableruntime::privatepayload::readOneShot(3, sessionPacket);
+#endif
+    if (! privatePayloadRead)
     {
         std::fprintf(stderr, "missing private programmable-runtime session secret\n");
         return 2;
@@ -2738,11 +2752,16 @@ int main (int argc, char** argv)
     volatile uint8_t* packetBytes = sessionPacket.data();
     for (size_t i = 0; i < sessionPacket.size(); ++i) packetBytes[i] = 0;
 #if defined(ARBIT_PROGRAMMABLE_TEST_MODE)
+#if defined(_WIN32)
+    testPrivateFdClosed = true;
+#else
     testPrivateFdClosed = fcntl(3, F_GETFD) == -1 && errno == EBADF;
+#endif
     testPacketZero = std::all_of(sessionPacket.begin(), sessionPacket.end(), [](uint8_t b) { return b == 0; });
     testSourceZero = std::all_of(sessionSecret.begin(), sessionSecret.end(), [](uint8_t b) { return b == 0; });
     const std::string marker = "M6_PRIVATE_CHANNEL_MARKER";
     for (int i = 0; i < argc; ++i) testMarkerInArgvOrEnv |= std::string(argv[i]).find(marker) != std::string::npos;
+#if ! defined(_WIN32)
     extern char** environ;
     for (char** entry = environ; entry != nullptr && *entry != nullptr; ++entry)
         testMarkerInArgvOrEnv |= std::string(*entry).find(marker) != std::string::npos;
